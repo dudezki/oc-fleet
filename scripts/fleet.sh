@@ -124,6 +124,8 @@ start_instance() {
   local inst=$1 port home
   port=$(port_for "$inst"); home=$(home_for "$inst")
   echo "▶ Starting $inst on :$port"
+  # Source .env for API keys (Gemini, Anthropic etc)
+  set -a; [ -f "$REPO_DIR/.env" ] && source "$REPO_DIR/.env"; set +a
   OPENCLAW_HOME="$home" openclaw gateway run --port "$port" --force > /tmp/fleet-$inst.log 2>&1 &
   echo $! > /tmp/fleet-$inst.pid
   sleep 5

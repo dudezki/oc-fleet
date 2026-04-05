@@ -294,9 +294,36 @@ http.createServer(async (req, res) => {
 
         } else if (p.action === 'accept') {
           const r = await pg.query(
-            `UPDATE fleet.handoffs SET status = 'accepted', accepted_at = now()
-             WHERE id = $1 RETURNING id, status`,
+            `UPDATE fleet.handoffs SET status = 'accepted', accepted_at = now(), updated_at = now()
+             WHERE id = $1 RETURNING id, status, accepted_at`,
             [p.handoff_id]
+          );
+          result = { handoff: r.rows[0] };
+
+        } else if (p.action === 'deny' || p.action === 'reject') {
+          // p: { handoff_id, reason? }
+          const r = await pg.query(
+            `UPDATE fleet.handoffs
+             SET status = 'rejected',
+                 updated_at = now(),
+                 current_state = current_state || $2::jsonb
+             WHERE id = $1
+             RETURNING id, status, updated_at`,
+            [p.handoff_id, JSON.stringify({ rejected_reason: p.reason || 'Denied by agent', rejected_at: new Date().toISOString() })]
+          );
+          result = { handoff: r.rows[0] };
+
+        } else if (p.action === 'complete') {
+          // p: { handoff_id, summary? }
+          const r = await pg.query(
+            `UPDATE fleet.handoffs
+             SET status = 'completed',
+                 completed_at = now(),
+                 updated_at = now(),
+                 current_state = current_state || $2::jsonb
+             WHERE id = $1
+             RETURNING id, status, completed_at`,
+            [p.handoff_id, JSON.stringify({ completion_summary: p.summary || '' })]
           );
           result = { handoff: r.rows[0] };
         }

@@ -224,12 +224,13 @@ http.createServer(async (req, res) => {
             );
             if (u.rows.length) { user_id = u.rows[0].account_id; department = department || u.rows[0].department; }
           }
-          const visibility = p.visibility || (user_id ? 'user' : 'org');
+          const target_type = p.target_type || (user_id ? 'user' : 'org');
+          const visibility = p.visibility || target_type;
           const r = await pg.query(
-            `INSERT INTO fleet.handoffs (org_id, from_agent_id, to_agent_id, summary, next_action, status, user_id, department, visibility)
-             VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)
+            `INSERT INTO fleet.handoffs (org_id, from_agent_id, to_agent_id, summary, next_action, status, user_id, department, visibility, target_type)
+             VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $9)
              RETURNING id, status, created_at`,
-            [p.org_id, p.from_agent_id, p.to_agent_id, p.summary, p.next_action || null, user_id, department, visibility]
+            [p.org_id, p.from_agent_id, p.to_agent_id, p.summary, p.next_action || null, user_id, department, visibility, target_type]
           );
           result = { handoff: r.rows[0] };
 

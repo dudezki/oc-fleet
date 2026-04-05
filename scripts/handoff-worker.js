@@ -63,25 +63,42 @@ async function proxyPost(endpoint, body) {
   return r.body;
 }
 
-// ── Inject system event via /hooks/wake HTTP endpoint ─────────────────────
-async function injectToAgent(agentInfo, text, telegramId = null) {
+// ── Deliver handoff to agent ────────────────────────────────────────────────
+async function injectToAgent(agentInfo, text, telegramId = null, targetType = 'org') {
   const { gateway_port, hooks_token, name } = agentInfo;
   if (!gateway_port || !hooks_token) {
     console.warn(`[worker] No hooks config for agent: ${name}`);
     return { success: false, error: 'no_hooks_config' };
   }
 
-  const fullText = telegramId
-    ? `${text}\n\n[Target Telegram User: ${telegramId}]`
-    : text;
-
   try {
-    const r = await httpPost(
-      `http://127.0.0.1:${gateway_port}/hooks/wake`,
-      { text: fullText, mode: 'now' },
-      hooks_token
-    );
-    if (r.body?.ok) {
+    let r;
+
+    if (telegramId) {
+      // Always use /hooks/agent when telegram_id is known
+      // This triggers a real agent turn that delivers directly to the user on Telegram
+      r = await httpPost(
+        `http://127.0.0.1:${gateway_port}/hooks/agent`,
+        {
+          message: text,
+          deliver: true,
+          channel: 'telegram',
+          to: String(telegramId),
+          timeoutSeconds: 60
+        },
+        hooks_token
+      );
+      console.log(`[worker] ✅ Agent turn → ${name} → Telegram:${telegramId}`);
+    } else {
+      // No telegram target — wake only (agent-to-agent context)
+      r = await httpPost(
+        `http://127.0.0.1:${gateway_port}/hooks/wake`,
+        { text, mode: 'now' },
+        hooks_token
+      );
+    }
+
+    if (r.body?.ok || r.body?.queued || r.status < 300) {
       console.log(`[worker] ✅ Delivered to ${name} (:${gateway_port})`);
       return { success: true };
     }
@@ -95,21 +112,24 @@ async function injectToAgent(agentInfo, text, telegramId = null) {
 
 // ── Build handoff system event text ──────────────────────────────────────────
 function buildEventText(handoff, fromAgentName, userName) {
-  const scope = handoff.target_type === 'org' ? '📢 ORG-WIDE BROADCAST'
-    : handoff.target_type === 'department' ? `📢 DEPT BROADCAST [${handoff.department}]`
-    : handoff.target_type === 'agent' ? '📩 AGENT HANDOFF'
-    : '📩 USER HANDOFF';
+  const scope = handoff.target_type === 'org' ? '📢 Org-Wide Message'
+    : handoff.target_type === 'department' ? `📢 Dept Message [${handoff.department}]`
+    : handoff.target_type === 'agent' ? '📩 Agent Handoff'
+    : '📩 Handoff';
 
+  // Clean notification format matching the desired output:
+  // "Org-wide Message from: <user>
+  // > <message>"
   return [
-    `${scope} — from ${fromAgentName}`,
+    `${scope} from: ${userName || fromAgentName}`,
     ``,
-    `👤 User: ${userName || handoff.telegram_id || 'N/A'}`,
-    `📋 Summary: ${handoff.summary}`,
-    handoff.next_action ? `⚡ Next action: ${handoff.next_action}` : null,
-    handoff.target_session_id ? `🔗 Session ID: ${handoff.target_session_id}` : null,
+    `> ${handoff.summary}`,
     ``,
-    `Handoff ID: ${handoff.id}`,
-    `Respond to the user and acknowledge this handoff when ready.`
+    handoff.next_action ? `Next action: ${handoff.next_action}` : null,
+    `Handoff ID: ${handoff.id.slice(0,8)}`,
+    ``,
+    `Send a brief acknowledgement to the user — do NOT expose internal details.`,
+    `Format: "📣 [YourAgentName] here — [brief ack of the message]. [How you can help]."`
   ].filter(Boolean).join('\n');
 }
 
@@ -248,7 +268,7 @@ async function run() {
           }
         }
 
-        const result = await injectToAgent(agentInfo, eventText, telegramId);
+        const result = await injectToAgent(agentInfo, eventText, telegramId, handoff.target_type);
         notifiedAgents.push({
           agent_id: agentId,
           agent_name: agentInfo.name,

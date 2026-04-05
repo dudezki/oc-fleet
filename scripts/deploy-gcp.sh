@@ -174,6 +174,7 @@ install_deps() {
   success "$label deps installed"
 }
 
+install_deps "$REPO_DIR"                   "oc-fleet-root (handoff-worker)"
 install_deps "$REPO_DIR/proxy"             "fleet-proxy"
 install_deps "$REPO_DIR/google-auth-proxy" "google-auth-proxy"
 

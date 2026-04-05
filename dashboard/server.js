@@ -8,7 +8,7 @@ const os = require('os');
 const fs = require('fs');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const { chunkText, embedTexts } = require('../cbfleet-rag/proxy/chunker');
+const { chunkText, embedTexts } = require('../proxy/chunker');
 
 const GEMINI_API_KEY = 'AIzaSyAksgdKNgnQ74ShoABJ2r6iik3yOXkqZUk';
 
@@ -357,7 +357,7 @@ app.post('/api/restart/:instance', async (req, res) => {
     send({ step: 1, label: `Stopped ✓`, status: 'done' });
 
     send({ step: 2, total: 3, label: 'Starting gateway…', status: 'running' });
-    const child = spawn('/Users/dudezkie/.nvm/versions/node/v24.13.1/bin/openclaw', ['gateway', 'run', '--port', String(inst.port), '--force'], {
+    const child = spawn(process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw', ['gateway', 'run', '--port', String(inst.port), '--force'], {
       env: { ...process.env, OPENCLAW_HOME: path.join(os.homedir(), inst.home) },
       detached: true, stdio: 'ignore',
     });
@@ -412,7 +412,7 @@ app.post('/api/stop/:instance', async (req, res) => {
 app.post('/api/proxy/restart', async (req, res) => {
   await killPort(PROXY_PORT);
 
-  const child = spawn('node', ['/Users/dudezkie/Projects/cbfleet-rag/proxy/server.js'], {
+  const child = spawn('node', [path.join(os.homedir(), 'oc-fleet/proxy/server.js')], {
     detached: true,
     stdio: 'ignore',
   });
@@ -1103,7 +1103,7 @@ app.post('/api/agent-configs/:agent_id', async (req, res) => {
 
 // POST /api/sync-sessions
 app.post('/api/sync-sessions', (req, res) => {
-  const child = spawn('node', ['/Users/dudezkie/Projects/cbfleet-rag/scripts/sync-sessions.js'], {
+  const child = spawn('node', [path.join(os.homedir(), 'oc-fleet/scripts/sync-sessions.js')], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let output = '';
@@ -1539,7 +1539,7 @@ app.post('/api/agents/spawn', async (req, res) => {
     // Step 8: Start the instance
     send({ step: 8, total: TOTAL, label: `Starting agent on port ${assignedPort}...`, status: 'running' });
     const child = spawn(
-      '/Users/dudezkie/.nvm/versions/node/v24.13.1/bin/openclaw',
+      process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw',
       ['gateway', 'run', '--port', String(assignedPort), '--force'],
       {
         env: { ...process.env, OPENCLAW_HOME: agentHome },
@@ -1579,8 +1579,8 @@ app.post('/api/agents/spawn', async (req, res) => {
 // ── Agent Spawner ────────────────────────────────────────────────────────────
 const { execFile, spawn: spawnProc } = require('child_process');
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
-const OPENCLAW_BIN = '/Users/dudezkie/.nvm/versions/node/v24.13.1/bin/openclaw';
-const ANTHRO_KEY_FILE = '/Users/dudezkie/cbfleet-rag-sales/.openclaw/agents/main/agent/auth-profiles.json';
+const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw';
+const ANTHRO_KEY_FILE = path.join(os.homedir(), 'cbfleet-rag-sales/.openclaw/agents/main/agent/auth-profiles.json');
 
 async function getNextPort() {
   const KNOWN = { sales:20010,support:20020,manager:20030,dev:20040,it:20050 };
@@ -1958,7 +1958,7 @@ app.post('/api/agents/restart-all', async (req, res) => {
       await killPort(inst.port);
 
       send({ step: i + 1, total, name: inst.displayName, status: 'starting', log: `Starting ${inst.displayName}…` });
-      const child = spawn('/Users/dudezkie/.nvm/versions/node/v24.13.1/bin/openclaw',
+      const child = spawn(process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw',
         ['gateway', 'run', '--port', String(inst.port), '--force'],
         { env: { ...process.env, OPENCLAW_HOME: path.join(os.homedir(), inst.home) }, detached: true, stdio: 'ignore' }
       );

@@ -355,14 +355,35 @@ chmod +x "$FLEET_SCRIPT"
 sudo ln -sf "$FLEET_SCRIPT" /usr/local/bin/fleet 2>/dev/null || true
 success "fleet.sh written — also available as 'fleet' command"
 
-# ── Sync sessions cron ────────────────────────────────────────────────────────
-SYNC_SCRIPT="$REPO_DIR/scripts/sync-sessions.js"
-if [ -f "$SYNC_SCRIPT" ]; then
-  info "Setting up sync-sessions cron..."
-  CRON_LINE="*/2 * * * * node $SYNC_SCRIPT >> /tmp/fleet-sync.log 2>&1"
-  (crontab -l 2>/dev/null | grep -v "sync-sessions"; echo "$CRON_LINE") | crontab -
-  success "Sync cron installed (every 2 min)"
-fi
+# ── Cron jobs ─────────────────────────────────────────────────────────────────
+info "Setting up cron jobs..."
+NODE_BIN=$(which node 2>/dev/null || echo "/usr/local/bin/node")
+
+# Write handoff-worker wrapper with correct PATH for cron context
+cat > "$REPO_DIR/scripts/run-handoff-worker.sh" <<WRAPPER
+#!/usr/bin/env bash
+export PATH="$(dirname $NODE_BIN):/usr/local/bin:\$PATH"
+export DATABASE_URL="$DB_URL_LOCAL"
+export ORG_ID="$ORG_ID"
+exec node "$REPO_DIR/scripts/handoff-worker.js"
+WRAPPER
+chmod +x "$REPO_DIR/scripts/run-handoff-worker.sh"
+
+# Build crontab (remove stale entries, add fresh)
+NEW_CRON=$(crontab -l 2>/dev/null | grep -v "sync-sessions" | grep -v "handoff-worker")
+
+# sync-sessions every 2 min
+[ -f "$REPO_DIR/scripts/sync-sessions.js" ] &&   NEW_CRON="$NEW_CRON
+*/2 * * * * $NODE_BIN $REPO_DIR/scripts/sync-sessions.js >> /tmp/fleet-sync.log 2>&1"
+
+# handoff-worker every 1 min
+[ -f "$REPO_DIR/scripts/handoff-worker.js" ] &&   NEW_CRON="$NEW_CRON
+*/1 * * * * $REPO_DIR/scripts/run-handoff-worker.sh >> /tmp/fleet-handoff-worker.log 2>&1"
+
+echo "$NEW_CRON" | crontab -
+success "Cron jobs installed:"
+info "  sync-sessions  → every 2 min"
+info "  handoff-worker → every 1 min"
 
 # ── Start everything ──────────────────────────────────────────────────────────
 info "Starting fleet..."

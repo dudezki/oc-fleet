@@ -1,0 +1,24 @@
+
+   /* :where() reduces specificity to zero, allowing any external class to override it instantly, but is removed for compatibility with older browsers */
+  :where([class^="duo-icons-"]), :where([class*=" duo-icons-"]) {
+    display: inline-block;
+    width: 1em;
+    height: 1em;
+    background-color: currentColor;
+    mask-repeat: no-repeat;
+    mask-size: 100% 100%;
+    vertical-align: middle;
+  }
+
+/* 2v ".duoicon-*" backward compatibility; it will be removed in future versions */
+
+.duo-icons-dashboard { -webkit-mask-image: var(--duo-icons-dashboard); mask-image: var(--duo-icons-dashboard); }
+.duo-icons-chip { -webkit-mask-image: var(--duo-icons-chip); mask-image: var(--duo-icons-chip); }
+.duo-icons-message-2 { -webkit-mask-image: var(--duo-icons-message-2); mask-image: var(--duo-icons-message-2); }
+.duo-icons-chart-pie { -webkit-mask-image: var(--duo-icons-chart-pie); mask-image: var(--duo-icons-chart-pie); }
+.duo-icons-compass { -webkit-mask-image: var(--duo-icons-compass); mask-image: var(--duo-icons-compass); }
+.duo-icons-check-circle { -webkit-mask-image: var(--duo-icons-check-circle); mask-image: var(--duo-icons-check-circle); }
+.duo-icons-book-2 { -webkit-mask-image: var(--duo-icons-book-2); mask-image: var(--duo-icons-book-2); }
+.duo-icons-user-card { -webkit-mask-image: var(--duo-icons-user-card); mask-image: var(--duo-icons-user-card); }
+.duo-icons-rocket { -webkit-mask-image: var(--duo-icons-rocket); mask-image: var(--duo-icons-rocket); }
+.duo-icons-settings { -webkit-mask-image: var(--duo-icons-settings); mask-image: var(--duo-icons-settings); }

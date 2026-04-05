@@ -9,7 +9,8 @@
   <script src="https://cdn.jsdelivr.net/npm/vue-router@4/dist/vue-router.global.prod.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
-  <script src="/duo-icons.js"></script>
+  <link rel="stylesheet" href="/duo-icons-base.css">
+  <link rel="stylesheet" href="/duo-icons-icons.css">
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
   <style>
@@ -4391,16 +4392,16 @@ const App = {
     const route = VueRouter.useRoute();
 
     const NAV = [
-      { path: '/dashboard',     label: 'Dashboard',     duoIcon: 'dashboard'   },
-      { path: '/memories',      label: 'Memories',      duoIcon: 'chip'        },
-      { path: '/sessions',      label: 'Sessions',      duoIcon: 'message_2'   },
-      { path: '/reports',       label: 'Reports',       duoIcon: 'chart_pie'   },
-      { path: '/handoffs',      label: 'Handoffs',      duoIcon: 'compass'     },
-      { path: '/tasks',         label: 'Tasks',         duoIcon: 'check_circle'},
-      { path: '/knowledge',     label: 'Knowledge',     duoIcon: 'book_2'      },
-      { path: '/accounts',      label: 'Accounts',      duoIcon: 'user_card'   },
-      { path: '/skills',        label: 'Skills',        duoIcon: 'rocket'      },
-      { path: '/settings',      label: 'Settings',      duoIcon: 'settings'    },
+      { path: '/dashboard',     label: 'Dashboard',     duoIcon: 'dashboard'      },
+      { path: '/memories',      label: 'Memories',      duoIcon: 'chip'           },
+      { path: '/sessions',      label: 'Sessions',      duoIcon: 'message_2'      },
+      { path: '/reports',       label: 'Reports',       duoIcon: 'chart_pie'      },
+      { path: '/handoffs',      label: 'Handoffs',      duoIcon: 'compass'        },
+      { path: '/tasks',         label: 'Tasks',         duoIcon: 'check_circle'   },
+      { path: '/knowledge',     label: 'Knowledge',     duoIcon: 'book_2'         },
+      { path: '/accounts',      label: 'Accounts',      duoIcon: 'user_card'      },
+      { path: '/skills',        label: 'Skills',        duoIcon: 'rocket'         },
+      { path: '/settings',      label: 'Settings',      duoIcon: 'settings'       },
     ];
     function getDuoIcon(name) {
       // Returns a placeholder; createIcons() will replace it with SVG
@@ -4528,7 +4529,7 @@ const App = {
                      :class="isActive(n.path)
                        ? 'bg-gray-800 text-white'
                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'">
-          <span class="w-5 flex items-center justify-center [&_svg]:w-[18px] [&_svg]:h-[18px] [&_svg]:flex-shrink-0" v-html="getDuoIcon(n.duoIcon)"></span>
+          <span :class="`duo-icons-${n.duoIcon}`" style="width:18px;height:18px;font-size:18px;"></span>
           <span>{{ n.label }}</span>
         </router-link>
       </nav>

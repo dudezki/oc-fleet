@@ -24,9 +24,17 @@
 
 <br/>
 
-> **oc-fleet** is a multi-agent AI orchestration platform built on [OpenClaw](https://openclaw.ai).  
-> Deploy a fleet of specialized AI agents — Sales, Support, Manager, Dev, IT — each with RAG memory,  
-> Telegram integration, skill routing, and a real-time dashboard. All from a single repo.
+> **OpenClaw Fleet** is a multi-agent AI orchestration platform built on [OpenClaw](https://openclaw.ai).
+>
+> Deploy a fleet of specialized AI agents — Sales, Support, Manager, Dev, IT — each powered by a
+> **persistent vector memory engine** that retrieves, ranks, and grounds every reply in real organizational knowledge.
+>
+> 🧠 **Long-term episodic memory** — agents remember past interactions across sessions
+> 📚 **Semantic RAG** — pgvector-backed knowledge retrieval before every single response
+> 🔍 **Knowledge indexing** — upload org content and have it instantly searchable by all agents
+> 💬 **Conversation continuity** — full message history, summaries, and handoff context preserved
+>
+> All wired together with Telegram, skill routing, OTP pairing, and a live Nexus dashboard. One repo, one deploy.
 
 <br/>
 

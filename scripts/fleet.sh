@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Fleet management script
+export PATH="/Users/dudezkie/.nvm/versions/node/v24.13.1/bin:$PATH"
 # Usage:
 #   ./fleet.sh start   [sales|support|manager|dev|it|all]
 #   ./fleet.sh stop    [sales|support|manager|dev|it|all]
@@ -9,9 +10,9 @@
 cmd="${1:-status}"
 target="${2:-all}"
 
-port_for()   { case $1 in sales) echo 20010;; support) echo 20020;; manager) echo 20030;; dev) echo 20040;; it) echo 20050;; esac; }
+port_for()   { case $1 in sales) echo 20010;; support) echo 20020;; manager) echo 20030;; dev) echo 20040;; it) echo 20050;; hr) echo 20060;; finance) echo 20070;; security) echo 20080;; esac; }
 home_for()   { echo "$HOME/cbfleet-rag-$1"; }
-instances()  { [ "$target" = "all" ] && echo "sales support manager dev it" || echo "$target"; }
+instances()  { [ "$target" = "all" ] && echo "sales support manager dev it hr finance security" || echo "$target"; }
 
 PROXY_PORT=20000
 PROXY_JS=/Users/dudezkie/Projects/cbfleet-rag/proxy/server.js
@@ -124,7 +125,7 @@ stop_instance() {
 
 status_all() {
   echo "=== Fleet Status ==="
-  for inst in sales support manager dev it; do
+  for inst in sales support manager dev it hr finance security; do
     local port r
     port=$(port_for "$inst")
     r=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$port/health 2>/dev/null)

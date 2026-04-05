@@ -1405,6 +1405,23 @@ http.createServer(async (req, res) => {
           reset_reasons: resetR.rows
         };
 
+      // ── Session: heatmap ─────────────────────────────────────────────────────
+      } else if (fn === "session/heatmap") {
+        // p: { org_id }
+        const r = await pg.query(`
+          SELECT
+            EXTRACT(DOW FROM m.created_at AT TIME ZONE 'Asia/Manila')::int AS day_of_week,
+            EXTRACT(HOUR FROM m.created_at AT TIME ZONE 'Asia/Manila')::int AS hour,
+            COUNT(*)::int AS message_count
+          FROM fleet.messages m
+          JOIN fleet.conversations c ON c.id = m.conversation_id
+          WHERE c.org_id = $1
+            AND m.created_at >= now() - interval '30 days'
+          GROUP BY day_of_week, hour
+          ORDER BY day_of_week, hour
+        `, [p.org_id]);
+        result = { heatmap: r.rows };
+
       } else {
         result = { error: `Unknown endpoint: ${fn}` };
       }

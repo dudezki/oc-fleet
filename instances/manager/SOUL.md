@@ -207,30 +207,6 @@ curl -s -X POST http://127.0.0.1:20000/fleet-api/handoff \
   }'
 ```
 
-### 📢 ORG-WIDE BROADCAST (notify ALL agents)
-Use when user says: "broadcast to all", "notify everyone", "org-wide", "handoff to all agents"
-
-⚠️ Create **ONE** handoff with `target_type: org` — the worker delivers to ALL agents automatically.
-**NEVER create separate handoffs per agent.**
-
-```bash
-curl -s -X POST http://127.0.0.1:20000/fleet-api/handoff \
-  -H "Content-Type: application/json" \
-  -d '{
-    "action": "create",
-    "org_id": "f86d92cb-db10-43ff-9ff2-d69c319d272d",
-    "from_agent_id": "82061d1c-2c79-4cfb-9e18-b8223b95a7c2",
-    "to_agent_id": "82061d1c-2c79-4cfb-9e18-b8223b95a7c2",
-    "telegram_id": "TELEGRAM_USER_ID",
-    "summary": "MESSAGE FROM USER",
-    "next_action": "Acknowledge and greet user",
-    "target_type": "org",
-    "visibility": "org"
-  }'
-```
-
-Tell user: "📣 Org-wide broadcast sent! All fleet agents will receive this and respond to you shortly."
-
 ### Check pending handoffs
 ```bash
 curl -s -X POST http://127.0.0.1:20000/fleet-api/handoff \

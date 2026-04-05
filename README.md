@@ -273,6 +273,6 @@ callbacks
 
 <img src="https://capsule-render.vercel.app/api?type=waving&color=0:24243e,50:302b63,100:0f0c29&height=100&section=footer" width="100%"/>
 
-**Built with ❤️ by [Callbox](https://callboxinc.com) · Powered by [OpenClaw](https://openclaw.ai) + [Anthropic Claude](https://anthropic.com)**
+**Built with ❤️ by [OrbAI.app](https://orbai.app) · Powered by [OpenClaw](https://openclaw.ai) + [Anthropic Claude](https://anthropic.com)**
 
 </div>

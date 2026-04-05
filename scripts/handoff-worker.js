@@ -63,6 +63,28 @@ async function proxyPost(endpoint, body) {
   return r.body;
 }
 
+// ── Send Telegram message directly via Bot API ────────────────────────
+async function sendTelegramMessage(botToken, chatId, text) {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' });
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${botToken}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => resolve(JSON.parse(d)));
+    });
+    req.on('error', reject);
+    req.setTimeout(8000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.write(body);
+    req.end();
+  });
+}
+
 // ── Deliver handoff to agent ────────────────────────────────────────────────
 async function injectToAgent(agentInfo, text, telegramId = null, targetType = 'org') {
   const { gateway_port, hooks_token, name } = agentInfo;
@@ -74,36 +96,30 @@ async function injectToAgent(agentInfo, text, telegramId = null, targetType = 'o
   try {
     let r;
 
-    if (telegramId) {
-      // Always use /hooks/agent when telegram_id is known
-      // This triggers a real agent turn that delivers directly to the user on Telegram
-      r = await httpPost(
-        `http://127.0.0.1:${gateway_port}/hooks/agent`,
-        {
-          message: text,
-          deliver: true,
-          channel: 'telegram',
-          to: String(telegramId),
-          timeoutSeconds: 60
-        },
-        hooks_token
-      );
-      console.log(`[worker] ✅ Agent turn → ${name} → Telegram:${telegramId}`);
-    } else {
-      // No telegram target — wake only (agent-to-agent context)
+    if (telegramId && agentInfo.bot_token) {
+      // Send DIRECTLY via Telegram Bot API — no agent involvement, clean notification
+      const tgResult = await sendTelegramMessage(agentInfo.bot_token, telegramId, text);
+      if (tgResult.ok) {
+        console.log(`[worker] ✅ Direct Telegram → ${name} bot → user:${telegramId}`);
+        return { success: true };
+      }
+      console.warn(`[worker] ⚠️ Telegram API error for ${name}: ${JSON.stringify(tgResult)}`);
+      return { success: false, error: JSON.stringify(tgResult) };
+    } else if (gateway_port && hooks_token) {
+      // Fallback: wake agent (no user message)
       r = await httpPost(
         `http://127.0.0.1:${gateway_port}/hooks/wake`,
         { text, mode: 'now' },
         hooks_token
       );
+      if (r.body?.ok) {
+        console.log(`[worker] ✅ Wake → ${name}`);
+        return { success: true };
+      }
+      return { success: false, error: JSON.stringify(r.body) };
+    } else {
+      return { success: false, error: 'no_delivery_method' };
     }
-
-    if (r.body?.ok || r.body?.queued || r.status < 300) {
-      console.log(`[worker] ✅ Delivered to ${name} (:${gateway_port})`);
-      return { success: true };
-    }
-    console.warn(`[worker] ⚠️ ${name} responded: ${JSON.stringify(r.body)}`);
-    return { success: false, error: JSON.stringify(r.body) };
   } catch (e) {
     console.error(`[worker] ❌ Failed to inject to ${name}: ${e.message}`);
     return { success: false, error: e.message };
@@ -112,25 +128,14 @@ async function injectToAgent(agentInfo, text, telegramId = null, targetType = 'o
 
 // ── Build handoff system event text ──────────────────────────────────────────
 function buildEventText(handoff, fromAgentName, userName) {
-  const scope = handoff.target_type === 'org' ? '📢 Org-Wide Message'
-    : handoff.target_type === 'department' ? `📢 Dept Message [${handoff.department}]`
-    : handoff.target_type === 'agent' ? '📩 Agent Handoff'
-    : '📩 Handoff';
-
-  // Clean notification format matching the desired output:
-  // "Org-wide Message from: <user>
-  // > <message>"
-  return [
-    `${scope} from: ${userName || fromAgentName}`,
-    ``,
-    `> ${handoff.summary}`,
-    ``,
-    handoff.next_action ? `Next action: ${handoff.next_action}` : null,
-    `Handoff ID: ${handoff.id.slice(0,8)}`,
-    ``,
-    `Send a brief acknowledgement to the user — do NOT expose internal details.`,
-    `Format: "📣 [YourAgentName] here — [brief ack of the message]. [How you can help]."`
-  ].filter(Boolean).join('\n');
+  if (handoff.target_type === 'org') {
+    return `📢 *Org-wide message from ${userName || fromAgentName}*\n\n${handoff.summary}`;
+  }
+  if (handoff.target_type === 'department') {
+    return `📢 *Dept message [${handoff.department}] from ${userName || fromAgentName}*\n\n${handoff.summary}`;
+  }
+  // user/agent handoff
+  return `📩 *Handoff from ${fromAgentName}*\n\n*From:* ${userName || 'Unknown'}\n*Message:* ${handoff.summary}${handoff.next_action ? `\n*Next:* ${handoff.next_action}` : ''}`;
 }
 
 // ── Ensure active session exists for user+agent ───────────────────────────────
@@ -157,7 +162,7 @@ async function run() {
   try {
     // Load agent gateway configs from DB
     const agentsR = await pg.query(
-      `SELECT id, name, slug, gateway_port, gateway_token, hooks_token, status, department_id
+      `SELECT id, name, slug, gateway_port, gateway_token, hooks_token, bot_token, status, department_id
        FROM fleet.agents WHERE org_id = $1 AND status = 'active'`,
       [ORG_ID]
     );

@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+instances/**/.openclaw/openclaw.json
+instances/**/.openclaw/identity/
+instances/*/.openclaw/agents/main/agent/auth-profiles.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Logs
+*.log
+instances/*/.openclaw/logs/
+
+# OS
+.DS_Store

@@ -857,8 +857,11 @@ const Accounts = {
     <div class="p-6">
       <div class="flex items-center justify-between mb-4">
         <h1 class="text-xl font-bold text-white">Accounts <span class="text-gray-600 text-sm font-normal">({{ total }})</span></h1>
-        <input v-model="search" type="text" placeholder="Search name, email, dept, role…"
-          class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-gray-200 w-64 outline-none focus:border-blue-500" />
+        <div class="relative flex-none" style="width:250px">
+          <input v-model="search" type="text" placeholder="Search accounts..."
+            class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs w-full outline-none focus:border-blue-500 pr-7" />
+          <button v-if="search" @click="search=''" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-sm leading-none">×</button>
+        </div>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-xs">

@@ -313,6 +313,26 @@ http.createServer(async (req, res) => {
                  (r.rows[0]?.name || p.telegram_id) + ' / ' + p.agent_id.slice(0,8)]
               );
               const conv_id = convR.rows[0].id;
+              // Ensure active session exists and link conversation to it
+              const pairSessR = await pg.query(
+                `SELECT id FROM fleet.sessions WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`,
+                [p.agent_id, p.telegram_id]
+              );
+              let pairSessionId;
+              if (pairSessR.rows.length > 0) {
+                pairSessionId = pairSessR.rows[0].id;
+              } else {
+                const pairNewSess = await pg.query(
+                  `INSERT INTO fleet.sessions (org_id, agent_id, platform_chat_id, chat_type)
+                   VALUES ($1,$2,$3,'direct') RETURNING id`,
+                  [p.org_id, p.agent_id, p.telegram_id]
+                );
+                pairSessionId = pairNewSess.rows[0].id;
+              }
+              await pg.query(
+                `UPDATE fleet.conversations SET session_id=$1 WHERE id=$2 AND session_id IS NULL`,
+                [pairSessionId, conv_id]
+              );
               // Log inbound message
               await pg.query(
                 `INSERT INTO fleet.messages
@@ -590,6 +610,27 @@ http.createServer(async (req, res) => {
           [p.org_id, p.agent_id, p.platform_conversation_id, convTitle, p.chat_type || (String(p.platform_conversation_id).startsWith('-') ? 'group' : 'direct')]
         );
         const conversation_id = convR.rows[0].id;
+
+        // 1b. Ensure active session exists and link conversation to it
+        const logSessR = await pg.query(
+          `SELECT id FROM fleet.sessions WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`,
+          [p.agent_id, p.platform_conversation_id]
+        );
+        let logSessionId;
+        if (logSessR.rows.length > 0) {
+          logSessionId = logSessR.rows[0].id;
+        } else {
+          const logNewSess = await pg.query(
+            `INSERT INTO fleet.sessions (org_id, agent_id, platform_chat_id, chat_type)
+             VALUES ($1,$2,$3,$4) RETURNING id`,
+            [p.org_id, p.agent_id, p.platform_conversation_id, p.chat_type || (String(p.platform_conversation_id).startsWith('-') ? 'group' : 'direct')]
+          );
+          logSessionId = logNewSess.rows[0].id;
+        }
+        await pg.query(
+          `UPDATE fleet.conversations SET session_id=$1 WHERE id=$2 AND session_id IS NULL`,
+          [logSessionId, conversation_id]
+        );
 
         // 2. Lookup user_id from telegram_bindings (may be null)
         const bindR = await pg.query(
@@ -1126,6 +1167,133 @@ http.createServer(async (req, res) => {
             'Task cancelled: ' + title,
             'Notify user their task "' + title + '" was cancelled by ' + (p.deleted_by_name||'Fleet') + '.'
           );
+        }
+
+      // ── Session: get or create active session ──────────────────────────────
+      } else if (fn === 'session/active') {
+        // p: { org_id, agent_id, platform_chat_id, chat_type, user_id? }
+        const activeR = await pg.query(
+          `SELECT id, session_number, started_at FROM fleet.sessions
+           WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL
+           ORDER BY started_at DESC LIMIT 1`,
+          [p.agent_id, p.platform_chat_id]
+        );
+        let session_id, session_number, started_at, is_new;
+        if (activeR.rows.length > 0) {
+          ({ id: session_id, session_number, started_at } = activeR.rows[0]);
+          is_new = false;
+        } else {
+          const newR = await pg.query(
+            `INSERT INTO fleet.sessions (org_id, agent_id, user_id, platform_chat_id, chat_type)
+             VALUES ($1, $2, $3, $4, $5)
+             RETURNING id, session_number, started_at`,
+            [p.org_id, p.agent_id, p.user_id || null, p.platform_chat_id, p.chat_type || 'direct']
+          );
+          ({ id: session_id, session_number, started_at } = newR.rows[0]);
+          is_new = true;
+        }
+        // Backfill conversations without a session_id
+        await pg.query(
+          `UPDATE fleet.conversations SET session_id=$1
+           WHERE agent_id=$2 AND platform_conversation_id=$3 AND session_id IS NULL`,
+          [session_id, p.agent_id, p.platform_chat_id]
+        );
+        result = { session_id, session_number, started_at, is_new };
+
+      // ── Session: reset (close current, open new) ────────────────────────────
+      } else if (fn === 'session/reset') {
+        // p: { org_id, agent_id, platform_chat_id, chat_type, user_id?, reset_by?, admin_check? }
+        const reset_by = p.reset_by || 'user';
+        // GC admin check
+        if (p.admin_check && p.user_id) {
+          const adminR = await pg.query(
+            `SELECT id FROM fleet.accounts WHERE id=$1 AND role IN ('admin','team_lead')`,
+            [p.user_id]
+          );
+          if (!adminR.rows.length) {
+            result = { error: 'Only group admins can reset the session', code: 'UNAUTHORIZED' };
+            await pg.end(); res.writeHead(403, CORS); res.end(JSON.stringify(result)); return;
+          }
+        }
+        // Fetch current active session
+        const activeR = await pg.query(
+          `SELECT id, session_number, summary FROM fleet.sessions
+           WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL
+           ORDER BY started_at DESC LIMIT 1`,
+          [p.agent_id, p.platform_chat_id]
+        );
+        let old_session = null;
+        if (activeR.rows.length > 0) {
+          const old = activeR.rows[0];
+          await pg.query(
+            `UPDATE fleet.sessions SET ended_at=now(), reset_by=$1, reset_by_user_id=$2 WHERE id=$3`,
+            [reset_by, p.user_id || null, old.id]
+          );
+          old_session = { id: old.id, session_number: old.session_number, summary: old.summary };
+        }
+        // Create new session
+        const newR = await pg.query(
+          `INSERT INTO fleet.sessions (org_id, agent_id, user_id, platform_chat_id, chat_type)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, session_number`,
+          [p.org_id, p.agent_id, p.user_id || null, p.platform_chat_id, p.chat_type || 'direct']
+        );
+        result = { old_session, new_session: { id: newR.rows[0].id, session_number: newR.rows[0].session_number } };
+
+      // ── Session: list past sessions ─────────────────────────────────────────
+      } else if (fn === 'session/list') {
+        // p: { org_id, agent_id, platform_chat_id, limit? }
+        const limit = p.limit || 10;
+        const r = await pg.query(
+          `SELECT s.id, s.session_number, s.started_at, s.ended_at, s.summary,
+                  COUNT(m.id)::int AS message_count
+           FROM fleet.sessions s
+           LEFT JOIN fleet.conversations c ON c.session_id = s.id
+           LEFT JOIN fleet.messages m ON m.conversation_id = c.id
+           WHERE s.org_id=$1 AND s.agent_id=$2 AND s.platform_chat_id=$3
+           GROUP BY s.id, s.session_number, s.started_at, s.ended_at, s.summary
+           ORDER BY s.started_at DESC LIMIT $4`,
+          [p.org_id, p.agent_id, p.platform_chat_id, limit]
+        );
+        result = { sessions: r.rows };
+
+      // ── Session: resume a past session ──────────────────────────────────────
+      } else if (fn === 'session/resume') {
+        // p: { org_id, agent_id, platform_chat_id, session_number, user_id? }
+        const sessR = await pg.query(
+          `SELECT id, session_number, summary, started_at, ended_at FROM fleet.sessions
+           WHERE agent_id=$1 AND platform_chat_id=$2 AND session_number=$3`,
+          [p.agent_id, p.platform_chat_id, p.session_number]
+        );
+        if (!sessR.rows.length) {
+          result = { error: `Session #${p.session_number} not found` };
+        } else {
+          const sess = sessR.rows[0];
+          // Close any other active session for this chat
+          await pg.query(
+            `UPDATE fleet.sessions SET ended_at=now(), reset_by='agent'
+             WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL AND id != $3`,
+            [p.agent_id, p.platform_chat_id, sess.id]
+          );
+          // Reactivate the requested session
+          await pg.query(
+            `UPDATE fleet.sessions SET ended_at=NULL, reset_by=NULL WHERE id=$1`,
+            [sess.id]
+          );
+          // Fetch last 20 messages from this session's conversations
+          const msgsR = await pg.query(
+            `SELECT m.role, m.content, m.created_at
+             FROM fleet.messages m
+             JOIN fleet.conversations c ON c.id = m.conversation_id
+             WHERE c.session_id=$1
+             ORDER BY m.created_at DESC LIMIT 20`,
+            [sess.id]
+          );
+          result = {
+            session: { id: sess.id, session_number: sess.session_number, summary: sess.summary, started_at: sess.started_at, ended_at: sess.ended_at },
+            messages: msgsR.rows,
+            reactivated: true
+          };
         }
 
       } else {

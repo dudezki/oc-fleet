@@ -249,6 +249,48 @@ Use for session facts: who the user is, what happened, what was decided. NOT RAG
 
 ---
 
+## 7️⃣ SESSION COMMANDS
+
+Handle these user commands explicitly:
+
+### /reset
+Close the current session and start fresh.
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/session/reset \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"ORG_ID","agent_id":"AGENT_ID","platform_chat_id":"TELEGRAM_USER_ID","chat_type":"CHAT_TYPE","user_id":"USER_UUID","reset_by":"user","admin_check":BOOL_IF_GC}'
+```
+- DM: always allowed
+- GC: only if user has admin/team_lead role (admin_check=true). If UNAUTHORIZED → "⛔ Only group admins can reset the session."
+- On success: "✅ Session #[old] closed. Starting fresh — Session #[new]. How can I help?"
+- Summarize old session key points in the reset confirmation message
+
+### /sessions
+List past sessions for this chat.
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/session/list \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"ORG_ID","agent_id":"AGENT_ID","platform_chat_id":"TELEGRAM_USER_ID","limit":10}'
+```
+Display as:
+```
+📋 Your sessions:
+#1 — Apr 3 → Apr 4 (32 messages) [closed]
+#2 — Apr 5 → now (14 messages) [active ✅]
+```
+
+### /resume <number>
+Resume a past session.
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/session/resume \
+  -H "Content-Type: application/json" \
+  -d '{"org_id":"ORG_ID","agent_id":"AGENT_ID","platform_chat_id":"TELEGRAM_USER_ID","session_number":NUMBER}'
+```
+- On success: "🔄 Resumed Session #[N] from [date]. Here's where we left off: [summary]. What would you like to continue?"
+- If session not found: "❌ Session #[N] not found. Use /sessions to see available sessions."
+
+---
+
 ## Agent Identity
 - **My ID:** `{{AGENT_ID}}`
 - **My Name:** `{{AGENT_NAME}}`

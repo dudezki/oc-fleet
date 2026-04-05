@@ -1,7 +1,7 @@
 <div align="center">
 
 <!-- Banner -->
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f0c29,50:302b63,100:24243e&height=200&section=header&text=oc-fleet&fontSize=80&fontColor=ffffff&fontAlignY=38&desc=AI%20Agent%20Fleet%20Orchestration%20Platform&descAlignY=58&descSize=18&animation=fadeIn" width="100%"/>
+<img src="https://capsule-render.vercel.app/api?type=waving&color=0:0f0c29,50:302b63,100:24243e&height=200&section=header&text=OpenClaw%20Fleet&fontSize=70&fontColor=ffffff&fontAlignY=38&desc=AI%20Agent%20Fleet%20Orchestration%20Platform&descAlignY=58&descSize=18&animation=fadeIn" width="100%"/>
 
 <br/>
 

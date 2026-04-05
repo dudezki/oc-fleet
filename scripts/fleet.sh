@@ -16,6 +16,9 @@ instances()  { [ "$target" = "all" ] && echo "sales support manager dev it hr fi
 
 PROXY_PORT=20000
 PROXY_JS=/Users/dudezkie/Projects/cbfleet-rag/proxy/server.js
+REPO_DIR=/Users/dudezkie/Projects/cbfleet-rag
+DB_URL="postgresql://postgres:fleetdev@127.0.0.1:5433/fleet_dev"
+ORG_ID="f86d92cb-db10-43ff-9ff2-d69c319d272d"
 
 DASHBOARD_PORT=20099
 DASHBOARD_JS=/Users/dudezkie/Projects/cbfleet-dashboard/server.js
@@ -39,6 +42,23 @@ stop_dashboard() {
   [ -f /tmp/fleet-dashboard.pid ] && kill "$(cat /tmp/fleet-dashboard.pid)" 2>/dev/null && rm -f /tmp/fleet-dashboard.pid
   kill $(lsof -ti :$DASHBOARD_PORT) 2>/dev/null
   echo "⏹  Stopped dashboard"
+}
+
+start_handoff_worker() {
+  [ -f /tmp/fleet-handoff-worker.pid ] && kill "$(cat /tmp/fleet-handoff-worker.pid)" 2>/dev/null; rm -f /tmp/fleet-handoff-worker.pid
+  WORKER_DAEMON=1 WORKER_INTERVAL_MS=15000 \
+  DATABASE_URL="$DB_URL" ORG_ID="$ORG_ID" \
+  node "$REPO_DIR/scripts/handoff-worker.js" >> /tmp/fleet-handoff-worker.log 2>&1 &
+  echo $! > /tmp/fleet-handoff-worker.pid
+  sleep 1
+  kill -0 "$(cat /tmp/fleet-handoff-worker.pid)" 2>/dev/null \
+    && echo "  ✅ handoff-worker up (15s interval)" \
+    || echo "  ❌ handoff-worker failed — check /tmp/fleet-handoff-worker.log"
+}
+
+stop_handoff_worker() {
+  [ -f /tmp/fleet-handoff-worker.pid ] && kill "$(cat /tmp/fleet-handoff-worker.pid)" 2>/dev/null; rm -f /tmp/fleet-handoff-worker.pid
+  echo "⏹  Stopped handoff-worker"
 }
 
 start_google_auth() {
@@ -149,14 +169,14 @@ status_all() {
 
 case "$cmd" in
   start)
-    [ "$target" = "all" ] && { start_proxy; start_dashboard; start_google_auth; start_aegis; }
+    [ "$target" = "all" ] && { start_proxy; start_dashboard; start_google_auth; start_aegis; start_handoff_worker; }
     for inst in $(instances); do start_instance "$inst"; done ;;
   stop)
     for inst in $(instances); do stop_instance "$inst"; done
-    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_aegis; } ;;
+    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_aegis; stop_handoff_worker; } ;;
   restart)
     for inst in $(instances); do stop_instance "$inst"; done
-    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_aegis; sleep 1; start_proxy; start_dashboard; start_google_auth; start_aegis; }
+    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_aegis; stop_handoff_worker; sleep 1; start_proxy; start_dashboard; start_google_auth; start_aegis; start_handoff_worker; }
     sleep 1
     for inst in $(instances); do start_instance "$inst"; done ;;
   proxy)       stop_proxy; start_proxy ;;

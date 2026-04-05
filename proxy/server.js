@@ -1014,8 +1014,8 @@ http.createServer(async (req, res) => {
         const [embedding] = await embedTexts([p.text], GEMINI_KEY);
         const embeddingStr = '[' + embedding.join(',') + ']';
         const r = await pg.query(
-          `SELECT * FROM fleet.search_memories_scored($1, $2::vector, $3::uuid, $5::text[], $4, 0.35, 0.25, 0.25, 0.15)`,
-          [p.org_id, embeddingStr, agentId, limit, memoryTypes]
+          `SELECT * FROM fleet.search_memories_scored($1, $2::vector, $3, $4, $5::text[], 0.35, 0.25, 0.25, 0.15)`,
+          [p.org_id, embeddingStr, limit, agentId, memoryTypes]
         );
         result = { results: r.rows };
 

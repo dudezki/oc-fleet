@@ -2288,6 +2288,12 @@ app.get('/api/agents/:slug/sessions', async (req, res) => {
 });
 
 // Serve duo-icons dist
+app.get('/duo-icons-base.css', (req, res) => {
+  res.sendFile(path.join(__dirname, 'node_modules/@duo-icons/tailwind/dist/base.css'));
+});
+app.get('/duo-icons-icons.css', (req, res) => {
+  res.sendFile(path.join(__dirname, 'node_modules/@duo-icons/tailwind/dist/icons.css'));
+});
 app.get('/duo-icons.js', (req, res) => {
   res.sendFile(path.join(__dirname, 'node_modules/duo-icons/dist/index.umd.cjs'));
 });

@@ -221,7 +221,10 @@ create_instance() {
 }
 EOF
 
-  cat > "$oc_dir/identity/auth-profiles.json" <<EOF
+  # auth-profiles must exist in BOTH identity/ and agents/main/agent/ (OpenClaw requirement)
+  for auth_dir in "$oc_dir/identity" "$oc_dir/agents/main/agent"; do
+    mkdir -p "$auth_dir"
+    cat > "$auth_dir/auth-profiles.json" <<EOF
 {
   "version": 1,
   "profiles": {
@@ -230,9 +233,39 @@ EOF
   "lastGood": { "anthropic": "anthropic:default" }
 }
 EOF
+  done
 
+  # Copy SOUL.md and fix UUID to match DB exactly
   local soul_src="$REPO_DIR/instances/$name/SOUL.md"
-  [ -f "$soul_src" ] && cp "$soul_src" "$oc_dir/workspace/SOUL.md"
+  if [ -f "$soul_src" ]; then
+    cp "$soul_src" "$oc_dir/workspace/SOUL.md"
+    # Get correct agent UUID from DB and fix any typos in SOUL.md
+    local db_uuid
+    db_uuid=$(PGPASSWORD="$PG_PASS" psql -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER_VAR" -d "$PG_DB" -t -c \
+      "SELECT id FROM fleet.agents WHERE slug='$name' LIMIT 1;" 2>/dev/null | xargs)
+    if [ -n "$db_uuid" ]; then
+      # Replace any UUID in SOUL.md that differs with the correct one
+      local soul_uuid
+      soul_uuid=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+        "$oc_dir/workspace/SOUL.md" | head -1)
+      if [ -n "$soul_uuid" ] && [ "$soul_uuid" != "$db_uuid" ]; then
+        sed -i "s/$soul_uuid/$db_uuid/g" "$oc_dir/workspace/SOUL.md"
+        warn "  Fixed UUID in $name SOUL.md: $soul_uuid → $db_uuid"
+      fi
+    fi
+  fi
+
+  # Also add hooks config with distinct token
+  local hooks_token
+  hooks_token=$(openssl rand -hex 32)
+  python3 -c "
+import json
+f='$oc_dir/openclaw.json'
+with open(f) as fp: d=json.load(fp)
+d['hooks'] = {'enabled': True, 'path': '/hooks', 'token': '$hooks_token', 'allowedAgentIds': ['main']}
+with open(f,'w') as fp: json.dump(d, fp, indent=2)
+" 2>/dev/null || true
+
   success "  $agent_name → port $port"
 }
 
@@ -241,6 +274,8 @@ create_instance "support" 20020 "$GATEWAY_TOKEN_SUPPORT" "$BOT_TOKEN_SUPPORT" "F
 create_instance "manager" 20030 "$GATEWAY_TOKEN_MANAGER" "$BOT_TOKEN_MANAGER" "Fleet-Manager" "claude-sonnet-4-6"
 create_instance "dev"     20040 "$GATEWAY_TOKEN_DEV"     "$BOT_TOKEN_DEV"     "Fleet-Dev"     "claude-sonnet-4-6"
 create_instance "it"      20050 "$GATEWAY_TOKEN_IT"      "$BOT_TOKEN_IT"      "Fleet-IT"      "claude-haiku-4-5"
+create_instance "hr"      20060 "${GATEWAY_TOKEN_HR:-$(openssl rand -hex 32)}" "${BOT_TOKEN_HR:-}" "Fleet-HR"      "claude-sonnet-4-6"
+create_instance "finance" 20070 "${GATEWAY_TOKEN_FINANCE:-$(openssl rand -hex 32)}" "${BOT_TOKEN_FINANCE:-}" "Fleet-Finance" "claude-sonnet-4-6"
 
 # ── fleet.sh ─────────────────────────────────────────────────────────────────
 info "Writing fleet.sh..."

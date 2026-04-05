@@ -82,24 +82,6 @@ else
   success "Node.js $(node --version) already installed"
 fi
 
-# ── Docker ──────────────────────────────────────────────────────────────────
-if ! command -v docker &>/dev/null; then
-  info "Installing Docker..."
-  sudo install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  sudo chmod a+r /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-    https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
-    sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-  sudo apt-get update -qq
-  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  sudo usermod -aG docker "$USER" || true
-  sudo systemctl enable docker --now
-  success "Docker installed"
-else
-  success "Docker already installed"
-fi
-
 # ── OpenClaw ────────────────────────────────────────────────────────────────
 if ! command -v openclaw &>/dev/null; then
   info "Installing OpenClaw..."
@@ -109,42 +91,80 @@ else
   success "OpenClaw already installed"
 fi
 
-# ── PostgreSQL (pgvector) Docker ────────────────────────────────────────────
-PG_CONTAINER="cbfleet-rag-db"
+# ── PostgreSQL 16 + pgvector (native — no Docker needed) ────────────────────
+# Designed for Proxmox VMs and LXC containers where Docker is unavailable.
 PG_PORT=5433
 PG_PASS="${PG_PASSWORD:-fleetdev}"
 PG_DB="${PG_DATABASE:-fleet_dev}"
 PG_USER="${PG_USER:-postgres}"
 DB_URL_LOCAL="postgresql://$PG_USER:$PG_PASS@127.0.0.1:$PG_PORT/$PG_DB"
 
-if docker ps -a --format '{{.Names}}' | grep -q "^${PG_CONTAINER}$"; then
-  info "PostgreSQL container already exists — starting if stopped..."
-  docker start "$PG_CONTAINER" 2>/dev/null || true
+if ! command -v psql &>/dev/null; then
+  info "Installing PostgreSQL 16..."
+  sudo apt-get install -y curl ca-certificates
+  sudo install -d /usr/share/postgresql-common/pgdg
+  curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail \
+    https://www.postgresql.org/media/keys/ACCC4CF8.asc
+  sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+    https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+    > /etc/apt/sources.list.d/pgdg.list'
+  sudo apt-get update -qq
+  sudo apt-get install -y postgresql-16 postgresql-16-pgvector
+  success "PostgreSQL 16 + pgvector installed"
 else
-  info "Starting PostgreSQL (pgvector)..."
-  docker run -d \
-    --name "$PG_CONTAINER" \
-    --restart unless-stopped \
-    -e POSTGRES_PASSWORD="$PG_PASS" \
-    -e POSTGRES_DB="$PG_DB" \
-    -p "127.0.0.1:$PG_PORT:5432" \
-    pgvector/pgvector:pg16
+  success "PostgreSQL already installed: $(psql --version)"
 fi
 
-# Wait for PG to be ready
-info "Waiting for PostgreSQL to be ready..."
-for i in $(seq 1 30); do
-  docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -q 2>/dev/null && break
+# Configure custom port if not default
+PG_CONF=$(sudo -u postgres psql -t -c "SHOW config_file;" 2>/dev/null | xargs)
+if [ -n "$PG_CONF" ]; then
+  CURRENT_PORT=$(sudo -u postgres psql -t -c "SHOW port;" 2>/dev/null | xargs)
+  if [ "$CURRENT_PORT" != "$PG_PORT" ]; then
+    info "Configuring PostgreSQL to use port $PG_PORT..."
+    sudo sed -i "s/^#*port = .*/port = $PG_PORT/" "$PG_CONF"
+    sudo systemctl restart postgresql
+    sleep 2
+  fi
+fi
+
+# Ensure PostgreSQL is running
+sudo systemctl enable postgresql --now 2>/dev/null || true
+for i in $(seq 1 15); do
+  sudo -u postgres pg_isready -q 2>/dev/null && break
   sleep 1
 done
-docker exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -q || die "PostgreSQL failed to start"
+sudo -u postgres pg_isready -q || die "PostgreSQL failed to start"
 success "PostgreSQL running on port $PG_PORT"
+
+# Create DB + user + enable pgvector
+info "Setting up database: $PG_DB..."
+sudo -u postgres psql -p "$PG_PORT" <<SQL 2>/dev/null || true
+DO \$\$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '$PG_USER') THEN
+    CREATE USER $PG_USER WITH SUPERUSER PASSWORD '$PG_PASS';
+  ELSE
+    ALTER USER $PG_USER WITH PASSWORD '$PG_PASS';
+  END IF;
+END \$\$;
+SELECT 'CREATE DATABASE $PG_DB' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$PG_DB')\\gexec
+SQL
+sudo -u postgres psql -p "$PG_PORT" -d "$PG_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;" 2>/dev/null || true
+success "Database ready: $PG_DB"
+
+# Update pg_hba.conf to allow password auth on localhost
+PG_HBA=$(sudo -u postgres psql -p "$PG_PORT" -t -c "SHOW hba_file;" 2>/dev/null | xargs)
+if [ -n "$PG_HBA" ]; then
+  if ! grep -q "host.*$PG_DB.*$PG_USER.*127.0.0.1" "$PG_HBA" 2>/dev/null; then
+    echo "host    $PG_DB    $PG_USER    127.0.0.1/32    md5" | sudo tee -a "$PG_HBA" > /dev/null
+    sudo systemctl reload postgresql
+  fi
+fi
 
 # ── DB Migration ────────────────────────────────────────────────────────────
 SCHEMA_FILE="$REPO_DIR/schema/fleet-rag-schema-migration.sql"
 if [ -f "$SCHEMA_FILE" ]; then
   info "Running DB schema migration..."
-  docker exec -i "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" < "$SCHEMA_FILE" \
+  PGPASSWORD="$PG_PASS" psql -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -f "$SCHEMA_FILE" \
     && success "Schema migration complete" \
     || warn "Schema migration had errors (may be safe if tables already exist)"
 else

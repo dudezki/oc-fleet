@@ -287,18 +287,23 @@ async function run() {
       }
 
       // ── Mark handoff as notified ───────────────────────────────────────────
+      const successCount = notifiedAgents.filter(a => a.success).length;
+      const totalTargets = notifiedAgents.length;
+      // Status: 'notified' if at least 1 delivered, 'failed' if all failed
+      const newStatus = successCount > 0 ? 'notified' : 'failed';
+
       await pg.query(
         `UPDATE fleet.handoffs
          SET notified_at = now(),
-             notified_agents = $1::jsonb,
-             delivery_error = $2,
+             status = $1,
+             notified_agents = $2::jsonb,
+             delivery_error = $3,
              updated_at = now()
-         WHERE id = $3`,
-        [JSON.stringify(notifiedAgents), hasError, handoff.id]
+         WHERE id = $4`,
+        [newStatus, JSON.stringify(notifiedAgents), hasError, handoff.id]
       );
 
-      const successCount = notifiedAgents.filter(a => a.success).length;
-      console.log(`[worker] Handoff ${handoff.id} → delivered to ${successCount}/${notifiedAgents.length} agents`);
+      console.log(`[worker] Handoff ${handoff.id} → ${newStatus} (${successCount}/${totalTargets} agents)`);
     }
 
   } catch (e) {

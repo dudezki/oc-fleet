@@ -816,10 +816,14 @@ const Accounts = {
     const roleBadge = (r) => ({ admin: 'bg-red-900/40 text-red-300 border-red-800', team_lead: 'bg-yellow-900/40 text-yellow-300 border-yellow-800', agent: 'bg-gray-700 text-gray-300 border-gray-600' }[r] || 'bg-gray-700 text-gray-300');
 
     const search = ref('');
+    const accountFilter = ref('all');
     const filtered = computed(() => {
+      let list = state.accounts;
+      if (accountFilter.value === 'bound') list = list.filter(a => a.bound === true || !!a.telegram_id);
+      else if (accountFilter.value === 'admins') list = list.filter(a => a.role === 'admin');
       const q = search.value.toLowerCase();
-      if (!q) return state.accounts;
-      return state.accounts.filter(a =>
+      if (!q) return list;
+      return list.filter(a =>
         (a.name||'').toLowerCase().includes(q) ||
         (a.email||'').toLowerCase().includes(q) ||
         (a.department||'').toLowerCase().includes(q) ||
@@ -851,14 +855,25 @@ const Accounts = {
       return m > 0 ? `${m}m ${s}s` : `${s}s`;
     }
 
-    return { accounts: filtered, total: computed(() => state.accounts.length), search, openAccount, roleBadge, fmtDate, fmtRel, getOtp, otpModal, expiresIn };
+    return { accounts: filtered, total: computed(() => state.accounts.length), search, accountFilter, openAccount, roleBadge, fmtDate, fmtRel, getOtp, otpModal, expiresIn };
   },
   template: `
     <div class="p-6">
       <div class="flex items-center justify-between mb-4">
         <h1 class="text-xl font-bold text-white">Accounts <span class="text-gray-600 text-sm font-normal">({{ total }})</span></h1>
-        <input v-model="search" type="text" placeholder="Search name, email, dept, role…"
-          class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-xs text-gray-200 w-64 outline-none focus:border-blue-500" />
+        <div class="flex items-center gap-3">
+          <div class="flex gap-2">
+            <button v-for="f in [{k:'all',l:'All'},{k:'bound',l:'Bound'},{k:'admins',l:'Admins'}]" :key="f.k"
+              @click="accountFilter = f.k"
+              :class="accountFilter === f.k ? 'bg-indigo-600 text-white' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'"
+              class="text-xs rounded-full px-3 py-1 cursor-pointer transition-colors">{{ f.l }}</button>
+          </div>
+          <div class="relative flex-none" style="width:250px">
+            <input v-model="search" type="text" placeholder="Search accounts..."
+              class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs w-full outline-none focus:border-blue-500 pr-7" />
+            <button v-if="search" @click="search=''" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-sm leading-none">×</button>
+          </div>
+        </div>
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-xs">

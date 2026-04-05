@@ -5,6 +5,7 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "duo-icons": "^2.0.1",
     "express": "^4.18.0",
     "node-fetch": "^2.7.0",
     "pg": "^8.20.0",

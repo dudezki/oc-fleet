@@ -14,3 +14,4 @@ instances/*/.openclaw/logs/
 
 # OS
 .DS_Store
+fleet_dump.sql

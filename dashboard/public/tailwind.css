@@ -1,0 +1,6 @@
+@import "tailwindcss";
+@import "@duo-icons/tailwind/base";
+@import "@duo-icons/tailwind/icons";
+@plugin "@duo-icons/tailwind";
+
+@custom-variant dark (&:where(.dark, .dark *));

@@ -3,14 +3,11 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Nexus — Fleet Dashboard</title>
-  <link rel="icon" type="image/svg+xml" href="/favicon.svg"/>
+  <title>Nexus — CB Fleet</title>
   <script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/vue-router@4/dist/vue-router.global.prod.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
-  <link rel="stylesheet" href="/duo-icons-base.css">
-  <link rel="stylesheet" href="/duo-icons-icons.css">
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
   <style>
@@ -194,9 +191,35 @@ async function openAgentConfig(name, inst) {
 const PROVIDER_MODELS = {
   anthropic:  ['claude-haiku-4-5', 'claude-sonnet-4-6', 'claude-opus-4-6'],
   openai:     ['gpt-4o-mini', 'gpt-4o', 'gpt-4-turbo', 'o1', 'o3-mini'],
+  google:     ['google/gemini-2.5-pro-preview-03-25', 'google/gemini-2.5-flash', 'google/gemini-2.0-flash', 'google/gemini-3.1-pro-preview'],
   openrouter: [],
   ollama:     [],
 };
+
+// Resolve display label for any model string
+function modelLabel(model) {
+  if (!model) return 'unknown';
+  const m = String(model);
+  if (m.includes('gemini-2.5-pro')) return 'gemini-2.5-pro';
+  if (m.includes('gemini-2.5-flash')) return 'gemini-2.5-flash';
+  if (m.includes('gemini-2.0')) return 'gemini-2.0-flash';
+  if (m.includes('gemini-3.1-pro')) return 'gemini-3.1-pro';
+  if (m.includes('gemini')) return 'gemini';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('opus')) return 'opus';
+  if (m.includes('haiku')) return 'haiku';
+  if (m.includes('gpt-4o')) return 'gpt-4o';
+  return m.split('/').pop();
+}
+
+function modelBadgeClass(model) {
+  const m = String(model || '');
+  if (m.includes('gemini-2.5-pro') || m.includes('gemini-3.1-pro')) return 'bg-blue-900/50 text-blue-300';
+  if (m.includes('gemini')) return 'bg-cyan-900/50 text-cyan-300';
+  if (m.includes('opus')) return 'bg-yellow-900/50 text-yellow-300';
+  if (m.includes('sonnet')) return 'bg-purple-900/50 text-purple-300';
+  return 'bg-slate-700/50 text-slate-300';
+}
 
 async function saveProviderConfig() {
   agentConfigDrawer.providerSaving = true;
@@ -255,7 +278,7 @@ async function saveAgentConfig() {
 
 const drawer = reactive({
   open: false, conv: null, messages: [], loading: false,
-  sending: false, inputText: '', session: null,
+  sending: false, inputText: '',
   context: { conversationId: null, userId: null, agentName: null, chatType: 'dm', groupChatId: null },
 });
 
@@ -371,7 +394,6 @@ async function openDrawer(conv) {
   drawer.messages = [];
   drawer.inputText = '';
   drawer.loading = true;
-  drawer.session = null;
   drawer.context = {
     conversationId: conv.id,
     userId: null,
@@ -380,16 +402,8 @@ async function openDrawer(conv) {
     groupChatId: null,
   };
   try {
-    const [msgRes, sessRes] = await Promise.all([
-      fetch(`/api/conversations/${conv.id}/messages`),
-      fetch(`/api/sessions?platform_chat_id=${encodeURIComponent(conv.platform_conversation_id || '')}&limit=5`).catch(() => null),
-    ]);
-    drawer.messages = await msgRes.json();
-    if (sessRes && sessRes.ok) {
-      const sd = await sessRes.json();
-      const slist = Array.isArray(sd) ? sd : (sd.sessions || []);
-      drawer.session = slist.find(s => !s.ended_at) || slist[0] || null;
-    }
+    const r = await fetch(`/api/conversations/${conv.id}/messages`);
+    drawer.messages = await r.json();
   } catch {}
   drawer.loading = false;
   await nextTick();
@@ -545,8 +559,8 @@ const FleetStatus = {
                 <div class="text-gray-500 text-xs font-mono">{{ configDrawer.id }}</div>
               </div>
               <span class="px-2 py-0.5 rounded-full text-[10px] font-medium ml-2"
-                :class="configDrawer.model === \"sonnet\" ? \"bg-purple-900/50 text-purple-300\" : \"bg-blue-900/50 text-blue-300\"">
-                {{ configDrawer.model }}
+                :class="modelBadgeClass(configDrawer.model)">
+                {{ modelLabel(configDrawer.model) }}
               </span>
             </div>
             <button @click="closeConfig" class="text-gray-500 hover:text-gray-300 text-xl leading-none">✕</button>
@@ -649,26 +663,7 @@ const Memories = {
 
 const Conversations = {
   setup() {
-    const sessions = Vue.ref([]);
-    Vue.onMounted(async () => {
-      try {
-        const r = await fetch('/api/sessions');
-        const d = await r.json();
-        sessions.value = Array.isArray(d) ? d : (d.sessions || []);
-      } catch {}
-    });
-    // Build lookup: platform_chat_id -> latest session
-    const sessionByChat = Vue.computed(() => {
-      const map = {};
-      for (const s of sessions.value) {
-        const key = s.platform_chat_id;
-        if (!key) continue;
-        if (!map[key] || new Date(s.started_at) > new Date(map[key].started_at)) map[key] = s;
-      }
-      return map;
-    });
-    function sessionForConv(c) { return sessionByChat.value[c.platform_conversation_id] || null; }
-    return { conversations: computed(() => state.conversations), fmtRel, agentLabel, openDrawer, sessionForConv };
+    return { conversations: computed(() => state.conversations), fmtRel, agentLabel, openDrawer };
   },
   template: `
     <div class="p-6">
@@ -681,7 +676,6 @@ const Conversations = {
               <th class="text-left py-2 pr-4 font-medium">Channel</th>
               <th class="text-left py-2 pr-4 font-medium">Type</th>
               <th class="text-left py-2 pr-4 font-medium">Title</th>
-              <th class="text-left py-2 pr-4 font-medium">Session</th>
               <th class="text-left py-2 pr-4 font-medium">Msgs</th>
               <th class="text-left py-2 pr-4 font-medium">Last Activity</th>
               <th class="text-left py-2 font-medium"></th>
@@ -703,19 +697,6 @@ const Conversations = {
                 </span>
               </td>
               <td class="py-2 pr-4 text-gray-300 text-xs">{{ c.title || c.platform_conversation_id || '—' }}</td>
-              <td class="py-2 pr-4">
-                <template v-if="sessionForConv(c)">
-                  <span v-if="!sessionForConv(c).ended_at"
-                    class="px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400 border border-green-700 whitespace-nowrap">
-                    #{{ sessionForConv(c).session_number || '?' }} ✅
-                  </span>
-                  <span v-else
-                    class="px-2 py-0.5 rounded-full text-xs bg-gray-700/50 text-gray-500 border border-gray-700 whitespace-nowrap">
-                    #{{ sessionForConv(c).session_number || '?' }}
-                  </span>
-                </template>
-                <span v-else class="text-gray-700">—</span>
-              </td>
               <td class="py-2 pr-4 text-gray-400 text-xs">{{ c.message_count ?? '—' }}</td>
               <td class="py-2 pr-4 text-gray-500 whitespace-nowrap text-xs">{{ fmtRel(c.last_message_at) }}</td>
               <td class="py-2">
@@ -726,7 +707,7 @@ const Conversations = {
               </td>
             </tr>
             <tr v-if="!conversations.length">
-              <td colspan="8" class="py-8 text-center text-gray-600">No conversations</td>
+              <td colspan="5" class="py-8 text-center text-gray-600">No conversations</td>
             </tr>
           </tbody>
         </table>
@@ -2873,15 +2854,6 @@ const Dashboard = {
       syncing.value = false;
     }
 
-    const sessionStats = Vue.ref({ total: 0, active: 0, today: 0, avg_messages: 0, recent: [] });
-    async function loadSessionStats() {
-      try {
-        const r = await fetch('/api/sessions/stats');
-        const d = await r.json();
-        if (!d.error) sessionStats.value = d;
-      } catch {}
-    }
-
     function salienceColor(v) {
       if (!v) return '#22c55e';
       if (v >= 0.7) return '#ef4444';
@@ -2889,7 +2861,7 @@ const Dashboard = {
       return '#22c55e';
     }
 
-    onMounted(() => { loadMemStats(); setInterval(loadMemStats, 30000); loadSessionStats(); setInterval(loadSessionStats, 15000); });
+    onMounted(() => { loadMemStats(); setInterval(loadMemStats, 30000); });
 
     function salienceTextColor(v) {
       if (!v) return 'text-gray-500';
@@ -2907,7 +2879,6 @@ const Dashboard = {
       memStats, MEM_TYPE_COLORS, salienceTextColor,
       agentColor, agentInitials, handoffBadge, salienceColor,
       syncing, syncMsg, syncSessions,
-      sessionStats, loadSessionStats,
       conversations: computed(() => state.conversations),
       wsConnected: computed(() => state.wsConnected),
       fmtRel, truncate, agentLabel, router,
@@ -2989,50 +2960,6 @@ const Dashboard = {
             <span class="text-2xl opacity-30">⚠</span>
           </div>
           <div class="text-xs text-gray-600 mt-2">past due date</div>
-        </div>
-      </div>
-
-      <!-- Session Stats Row -->
-      <div class="dash-row grid grid-cols-4 gap-4 mb-6">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 cursor-pointer hover:border-gray-700 transition-colors" @click="router.push('/sessions')">
-          <div class="flex items-start justify-between">
-            <div>
-              <div class="text-3xl font-bold text-white">{{ sessionStats.total }}</div>
-              <div class="text-xs text-gray-500 mt-1">Total Sessions</div>
-            </div>
-            <span class="text-2xl opacity-30">🔄</span>
-          </div>
-          <div class="text-xs text-gray-600 mt-2">all time</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 cursor-pointer hover:border-gray-700 transition-colors" @click="router.push('/sessions')">
-          <div class="flex items-start justify-between">
-            <div>
-              <div class="text-3xl font-bold text-green-400">{{ sessionStats.active }}</div>
-              <div class="text-xs text-gray-500 mt-1">Active Sessions</div>
-            </div>
-            <span class="text-2xl opacity-30">🟢</span>
-          </div>
-          <div class="text-xs text-gray-600 mt-2">right now</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 cursor-pointer hover:border-gray-700 transition-colors" @click="router.push('/sessions')">
-          <div class="flex items-start justify-between">
-            <div>
-              <div class="text-3xl font-bold text-blue-400">{{ sessionStats.today }}</div>
-              <div class="text-xs text-gray-500 mt-1">Sessions Today</div>
-            </div>
-            <span class="text-2xl opacity-30">📅</span>
-          </div>
-          <div class="text-xs text-gray-600 mt-2">started today</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 cursor-pointer hover:border-gray-700 transition-colors" @click="router.push('/reports')">
-          <div class="flex items-start justify-between">
-            <div>
-              <div class="text-3xl font-bold text-purple-400">{{ sessionStats.avg_messages }}</div>
-              <div class="text-xs text-gray-500 mt-1">Avg Messages/Session</div>
-            </div>
-            <span class="text-2xl opacity-30">📨</span>
-          </div>
-          <div class="text-xs text-gray-600 mt-2">avg per session</div>
         </div>
       </div>
 
@@ -3125,7 +3052,7 @@ const Dashboard = {
           <h2 class="text-sm font-semibold text-gray-300 mb-3">Conversation Activity</h2>
           <div class="space-y-1.5 max-h-64 overflow-y-auto pr-1">
             <div v-for="c in conversations" :key="c.id"
-                 @click="router.push('/sessions')"
+                 @click="router.push('/conversations')"
                  class="flex items-center gap-3 p-2 rounded-lg hover:bg-gray-800/50 cursor-pointer transition-colors">
               <div class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold shrink-0"
                    :style="{ background: agentColor(c.agent_name) }">
@@ -3196,9 +3123,9 @@ const Dashboard = {
                 class="text-xs px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white transition-colors">
           {{ syncing ? 'Syncing…' : 'Sync Sessions' }}
         </button>
-        <button @click="router.push('/sessions')"
+        <button @click="router.push('/conversations')"
                 class="text-xs px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-200 transition-colors">
-          View Sessions
+          View All Conversations
         </button>
         <button @click="router.push('/handoffs')"
                 class="text-xs px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-200 transition-colors">
@@ -3259,43 +3186,6 @@ const Dashboard = {
             Total: <span class="text-gray-300">{{ memStats.total }}</span> memories
           </div>
         </div>
-      </div>
-
-      <!-- Recent Sessions -->
-      <div class="dash-row bg-gray-900 border border-gray-800 rounded-xl p-4 mt-6">
-        <div class="flex items-center justify-between mb-3">
-          <h2 class="text-sm font-semibold text-gray-300">Recent Sessions</h2>
-          <button @click="router.push('/sessions')" class="text-xs text-blue-400 hover:text-blue-300 transition-colors">View all →</button>
-        </div>
-        <div v-if="!sessionStats.recent.length" class="text-xs text-gray-600 py-4 text-center">No sessions yet</div>
-        <table v-else class="w-full text-xs">
-          <thead>
-            <tr class="text-gray-600 border-b border-gray-800">
-              <th class="text-left py-1.5 pr-3 font-medium">Agent</th>
-              <th class="text-left py-1.5 pr-3 font-medium">Type</th>
-              <th class="text-left py-1.5 pr-3 font-medium">Started</th>
-              <th class="text-left py-1.5 pr-3 font-medium">Messages</th>
-              <th class="text-left py-1.5 font-medium">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="s in sessionStats.recent" :key="s.id" class="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer" @click="router.push('/sessions')">
-              <td class="py-1.5 pr-3 text-blue-400">{{ s.agent_name || (s.agent_id ? s.agent_id.slice(0,8)+'…' : '—') }}</td>
-              <td class="py-1.5 pr-3">
-                <span :class="(s.is_group || s.chat_type === 'group') ? 'bg-green-900/50 text-green-300 border-green-700' : 'bg-gray-800 text-gray-400 border-gray-700'"
-                      class="px-1.5 py-0.5 rounded border text-xs">
-                  {{ (s.is_group || s.chat_type === 'group') ? '👥 GC' : '💬 DM' }}
-                </span>
-              </td>
-              <td class="py-1.5 pr-3 text-gray-400 whitespace-nowrap">{{ fmtRel(s.started_at) }}</td>
-              <td class="py-1.5 pr-3 text-gray-400">{{ s.message_count ?? '—' }}</td>
-              <td class="py-1.5">
-                <span v-if="!s.ended_at" class="px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400 border border-green-700">active ✅</span>
-                <span v-else class="px-2 py-0.5 rounded-full text-xs bg-gray-700/50 text-gray-500 border border-gray-700">closed</span>
-              </td>
-            </tr>
-          </tbody>
-        </table>
       </div>
 
     </div>
@@ -3534,7 +3424,7 @@ const Settings = {
                         class="px-2 py-0.5 rounded-full">{{ a.status || '—' }}</span>
                 </td>
                 <td class="py-2.5 px-4 text-gray-400">{{ a.provider || '—' }}</td>
-                <td class="py-2.5 px-4 text-gray-400 font-mono">{{ a.model || '—' }}</td>
+                <td class="py-2.5 px-4"><span :class="'px-1.5 py-0.5 rounded text-xs font-mono ' + modelBadgeClass(a.model)">{{ modelLabel(a.model) || '—' }}</span></td>
                 <td class="py-2.5 px-4 text-gray-500">{{ a.port || '—' }}</td>
                 <td class="py-2.5 px-4 text-gray-600 font-mono text-[10px]">{{ (a.id||'').slice(0,8) }}</td>
               </tr>
@@ -3625,30 +3515,9 @@ const AgentProfile = {
       provSaving.value = false;
     }
 
-    // Sessions tab
-    const agentSessions = ref([]);
-    const agentSessionsLoading = ref(false);
-    const agentSessionsTotal = ref(0);
-    const agentSessionsActive = ref(0);
-
-    async function loadAgentSessions() {
-      if (!slug.value) return;
-      agentSessionsLoading.value = true;
-      try {
-        const r = await fetch(`/api/agents/${slug.value}/sessions?limit=20`);
-        const d = await r.json();
-        agentSessions.value = d.sessions || [];
-        agentSessionsTotal.value = d.total || 0;
-        agentSessionsActive.value = d.active || 0;
-      } catch {}
-      agentSessionsLoading.value = false;
-    }
-
-    watch(tab, (t) => { if (t === 'sessions') loadAgentSessions(); });
-
     onMounted(loadAgent);
-    watch(slug, () => { agentSessions.value = []; loadAgent(); });
-    return { loading, error, agent, tab, draft, instrSaving, instrSaved, instrError, provForm, provSaving, provSaved, provError, saveInstructions, saveProvider, globalPrompt, showGlobalPrompt, fmtDate, fmtRel, highlightJson, PROVIDER_MODELS, router, slug, agentSessions, agentSessionsLoading, agentSessionsTotal, agentSessionsActive };
+    watch(slug, loadAgent);
+    return { loading, error, agent, tab, draft, instrSaving, instrSaved, instrError, provForm, provSaving, provSaved, provError, saveInstructions, saveProvider, globalPrompt, showGlobalPrompt, fmtDate, highlightJson, PROVIDER_MODELS, modelLabel, modelBadgeClass, router, slug };
   },
   template: `
     <div class="p-6 w-full">
@@ -3702,7 +3571,7 @@ const AgentProfile = {
 
         <!-- Tabs -->
         <div class="flex gap-1 mb-6 border-b border-gray-800">
-          <button v-for="t in [{id:'instructions',label:'Instructions'},{id:'skills',label:'Skills'},{id:'provider',label:'Provider'},{id:'stats',label:'Stats'},{id:'sessions',label:'Sessions'}]"
+          <button v-for="t in [{id:'instructions',label:'Instructions'},{id:'skills',label:'Skills'},{id:'provider',label:'Provider'},{id:'stats',label:'Stats'}]"
                   :key="t.id" @click="tab = t.id"
                   :class="tab===t.id ? 'text-white border-b-2 border-blue-500' : 'text-gray-500 hover:text-gray-300'"
                   class="px-4 py-2 text-xs font-medium transition-colors -mb-px">
@@ -3870,494 +3739,7 @@ const AgentProfile = {
           </div>
         </div>
 
-        <!-- Sessions Tab -->
-        <div v-if="tab==='sessions'" class="space-y-4">
-          <!-- Stats pills -->
-          <div class="grid grid-cols-3 gap-3">
-            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
-              <div class="text-2xl font-bold text-white mb-1">{{ agentSessionsTotal }}</div>
-              <div class="text-xs text-gray-500">Total Sessions</div>
-            </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
-              <div class="text-2xl font-bold text-green-400 mb-1">{{ agentSessionsActive }}</div>
-              <div class="text-xs text-gray-500">Active Sessions</div>
-            </div>
-            <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
-              <div class="text-2xl font-bold text-blue-400 mb-1">
-                {{ agentSessions.length ? Math.round(agentSessions.reduce((a,s)=>a+(s.message_count||0),0)/agentSessions.length) : 0 }}
-              </div>
-              <div class="text-xs text-gray-500">Avg Msgs / Session</div>
-            </div>
-          </div>
-
-          <!-- Sessions list -->
-          <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
-            <div class="flex items-center justify-between px-4 py-3 border-b border-gray-800">
-              <span class="text-xs font-semibold text-gray-400 uppercase tracking-wide">Recent Sessions</span>
-              <router-link :to="'/sessions'" class="text-xs text-blue-400 hover:text-blue-300 transition-colors">View all →</router-link>
-            </div>
-            <div v-if="agentSessionsLoading" class="text-xs text-gray-600 py-6 text-center">Loading…</div>
-            <div v-else-if="!agentSessions.length" class="text-xs text-gray-600 py-6 text-center">No sessions for this agent.</div>
-            <table v-else class="w-full text-xs">
-              <thead>
-                <tr class="text-gray-500 border-b border-gray-800">
-                  <th class="text-left py-2 px-4 font-medium">#</th>
-                  <th class="text-left py-2 px-4 font-medium">Chat ID</th>
-                  <th class="text-left py-2 px-4 font-medium">Type</th>
-                  <th class="text-left py-2 px-4 font-medium">Started</th>
-                  <th class="text-left py-2 px-4 font-medium">Ended</th>
-                  <th class="text-left py-2 px-4 font-medium">Msgs</th>
-                  <th class="text-left py-2 px-4 font-medium">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="s in agentSessions" :key="s.id" class="border-b border-gray-800/50 hover:bg-gray-800/30">
-                  <td class="py-2 px-4 text-gray-500 font-mono">{{ s.session_number || '—' }}</td>
-                  <td class="py-2 px-4 text-gray-400 font-mono">{{ s.platform_chat_id ? String(s.platform_chat_id).slice(0,12)+(String(s.platform_chat_id).length>12?'…':'') : '—' }}</td>
-                  <td class="py-2 px-4">
-                    <span :class="(s.is_group||s.chat_type==='group') ? 'bg-green-900/50 text-green-300 border-green-700' : 'bg-gray-800 text-gray-400 border-gray-700'"
-                          class="px-2 py-0.5 rounded border text-xs">
-                      {{ (s.is_group||s.chat_type==='group') ? '👥 GC' : '💬 DM' }}
-                    </span>
-                  </td>
-                  <td class="py-2 px-4 text-gray-400 whitespace-nowrap">{{ fmtRel(s.started_at) }}</td>
-                  <td class="py-2 px-4 text-gray-500 whitespace-nowrap">{{ s.ended_at ? fmtRel(s.ended_at) : '—' }}</td>
-                  <td class="py-2 px-4 text-gray-400">{{ s.message_count ?? '—' }}</td>
-                  <td class="py-2 px-4">
-                    <span v-if="!s.ended_at" class="px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400 border border-green-700">active ✅</span>
-                    <span v-else class="px-2 py-0.5 rounded-full text-xs bg-gray-700/50 text-gray-500 border border-gray-700">closed</span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </div>
-
       </template>
-    </div>
-  `,
-};
-
-// ─── Sessions ─────────────────────────────────────────────────────────────────
-const Sessions = {
-  setup() {
-    const sessions     = Vue.ref([]);
-    const loading      = Vue.ref(true);
-    const filterAgent  = Vue.ref('');
-    const filterType   = Vue.ref(''); // '' | 'dm' | 'gc'
-    const actionState  = Vue.reactive({ busy: false, error: '', success: '' });
-
-    // Conversation drawer state
-    const drawer = Vue.reactive({
-      open: false,
-      session: null,
-      messages: [],
-      loading: false,
-    });
-
-    const agents = Vue.computed(() => {
-      const seen = new Set();
-      const out = [];
-      for (const s of sessions.value) {
-        const key = s.agent_id || s.agent_name || '';
-        if (key && !seen.has(key)) { seen.add(key); out.push({ id: s.agent_id || key, label: s.agent_name || s.agent_id || key }); }
-      }
-      return out;
-    });
-
-    const filtered = Vue.computed(() => {
-      let list = sessions.value;
-      if (filterAgent.value) list = list.filter(s => (s.agent_id || s.agent_name || '') === filterAgent.value);
-      if (filterType.value === 'dm') list = list.filter(s => !s.is_group);
-      if (filterType.value === 'gc') list = list.filter(s => s.is_group);
-      return list;
-    });
-
-    const totalSessions  = Vue.computed(() => sessions.value.length);
-    const activeSessions = Vue.computed(() => sessions.value.filter(s => !s.ended_at).length);
-    const avgMessages    = Vue.computed(() => {
-      if (!sessions.value.length) return 0;
-      const total = sessions.value.reduce((a, s) => a + (s.message_count || 0), 0);
-      return Math.round(total / sessions.value.length);
-    });
-
-    async function load() {
-      try {
-        const params = new URLSearchParams();
-        if (filterAgent.value) params.set('agent_id', filterAgent.value);
-        const r = await fetch('/api/sessions' + (params.toString() ? '?' + params : ''));
-        const data = await r.json();
-        sessions.value = Array.isArray(data) ? data : (data.sessions || []);
-      } catch (e) {
-        console.error('Sessions load error', e);
-      } finally {
-        loading.value = false;
-      }
-    }
-
-    async function openConvDrawer(s) {
-      drawer.open = true;
-      drawer.session = s;
-      drawer.messages = [];
-      drawer.loading = true;
-      try {
-        const r = await fetch(`/api/sessions/${s.id}/messages?limit=100`);
-        const data = await r.json();
-        drawer.messages = data.messages || [];
-        Vue.nextTick(() => {
-          const el = document.getElementById('sess-msg-scroll');
-          if (el) el.scrollTop = el.scrollHeight;
-        });
-      } catch (e) { console.error('Failed to load messages', e); }
-      drawer.loading = false;
-    }
-
-    function closeDrawer() {
-      drawer.open = false;
-      drawer.session = null;
-      drawer.messages = [];
-    }
-
-    async function resumeSession(s) {
-      actionState.busy = true; actionState.error = ''; actionState.success = '';
-      try {
-        const r = await fetch('/api/sessions/resume', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent_id: s.agent_id, platform_chat_id: s.platform_chat_id, session_id: s.id }),
-        });
-        const data = await r.json();
-        actionState.success = data.reactivated ? 'Session resumed ✓' : 'Session is already active ✓';
-        await load();
-      } catch (e) { actionState.error = e.message; }
-      actionState.busy = false;
-    }
-
-    async function resetSession(s) {
-      actionState.busy = true; actionState.error = ''; actionState.success = '';
-      try {
-        const r = await fetch('/api/sessions/reset', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent_id: s.agent_id, platform_chat_id: s.platform_chat_id }),
-        });
-        await r.json();
-        actionState.success = 'Session closed & new session started ✓';
-        closeDrawer();
-        await load();
-      } catch (e) { actionState.error = e.message; }
-      actionState.busy = false;
-    }
-
-    function agentDisplayName(s) {
-      if (s.agent_name) return s.agent_name;
-      const inst = (state.instances || []).find(i => i.id === s.agent_id);
-      return inst ? inst.displayName : (s.agent_id ? s.agent_id.slice(0, 8) + '…' : '—');
-    }
-
-    function accountDisplayName(s) {
-      return s.account_name || (s.platform_chat_id ? String(s.platform_chat_id).slice(0, 12) + (String(s.platform_chat_id).length > 12 ? '…' : '') : '—');
-    }
-
-    function chatTypeLabel(s) {
-      if (s.is_group) return { label: '👥 GC', cls: 'bg-green-900/50 text-green-300 border-green-700' };
-      return { label: '💬 DM', cls: 'bg-gray-800 text-gray-400 border-gray-700' };
-    }
-
-    function drawerTitle(s) {
-      if (!s) return '';
-      const acct = s.account_name || s.platform_chat_id || '?';
-      const agent = agentDisplayName(s);
-      const num = s.session_number || '?';
-      const started = s.started_at ? fmtDate(s.started_at) : '?';
-      return `Session #${num} — ${acct} — ${agent} — ${started}`;
-    }
-
-    Vue.onMounted(() => {
-      load();
-      const timer = setInterval(load, 10000);
-      Vue.onUnmounted(() => clearInterval(timer));
-    });
-
-    return {
-      sessions, filtered, loading, filterAgent, filterType, agents,
-      totalSessions, activeSessions, avgMessages,
-      drawer, actionState,
-      openConvDrawer, closeDrawer, resumeSession, resetSession,
-      agentDisplayName, accountDisplayName, chatTypeLabel, drawerTitle,
-      fmtDate, fmtRel, truncate,
-    };
-  },
-  template: `
-    <div class="p-6">
-      <!-- Header -->
-      <div class="flex items-center justify-between mb-5">
-        <h1 class="text-xl font-bold text-white">Sessions</h1>
-        <span class="text-xs text-gray-500">auto-refresh every 10s · click row to view thread</span>
-      </div>
-
-      <!-- Stats bar -->
-      <div class="grid grid-cols-3 gap-4 mb-6">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div class="text-3xl font-bold text-white">{{ totalSessions }}</div>
-          <div class="text-xs text-gray-500 mt-1">Total Sessions</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div class="text-3xl font-bold text-green-400">{{ activeSessions }}</div>
-          <div class="text-xs text-gray-500 mt-1">Active Sessions</div>
-        </div>
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
-          <div class="text-3xl font-bold text-blue-400">{{ avgMessages }}</div>
-          <div class="text-xs text-gray-500 mt-1">Avg Msgs / Session</div>
-        </div>
-      </div>
-
-      <!-- Filters -->
-      <div class="flex items-center gap-3 mb-4">
-        <select v-model="filterAgent"
-          class="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500">
-          <option value="">All Agents</option>
-          <option v-for="a in agents" :key="a.id" :value="a.id">{{ a.label }}</option>
-        </select>
-        <div class="flex gap-1">
-          <button @click="filterType = ''"
-            :class="filterType === '' ? 'bg-gray-700 text-white' : 'bg-gray-800/50 text-gray-500 hover:text-gray-300'"
-            class="px-3 py-1.5 rounded text-xs transition-colors">All</button>
-          <button @click="filterType = 'dm'"
-            :class="filterType === 'dm' ? 'bg-gray-700 text-white' : 'bg-gray-800/50 text-gray-500 hover:text-gray-300'"
-            class="px-3 py-1.5 rounded text-xs transition-colors">💬 DM</button>
-          <button @click="filterType = 'gc'"
-            :class="filterType === 'gc' ? 'bg-gray-700 text-white' : 'bg-gray-800/50 text-gray-500 hover:text-gray-300'"
-            class="px-3 py-1.5 rounded text-xs transition-colors">👥 GC</button>
-        </div>
-      </div>
-
-      <!-- Table -->
-      <div v-if="loading" class="text-gray-500 py-8 text-center text-sm">Loading sessions…</div>
-      <div v-else class="overflow-x-auto">
-        <table class="w-full text-xs">
-          <thead>
-            <tr class="text-gray-500 border-b border-gray-800">
-              <th class="text-left py-2 pr-3 font-medium">#</th>
-              <th class="text-left py-2 pr-3 font-medium">Agent</th>
-              <th class="text-left py-2 pr-3 font-medium">Account</th>
-              <th class="text-left py-2 pr-3 font-medium">Type</th>
-              <th class="text-left py-2 pr-3 font-medium">Started</th>
-              <th class="text-left py-2 pr-3 font-medium">Ended</th>
-              <th class="text-left py-2 pr-3 font-medium">Msgs</th>
-              <th class="text-left py-2 pr-3 font-medium">Summary</th>
-              <th class="text-left py-2 font-medium">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="s in filtered" :key="s.id"
-                class="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer dash-row"
-                @click="openConvDrawer(s)">
-              <td class="py-2 pr-3 text-gray-500 font-mono">{{ s.session_number || '—' }}</td>
-              <td class="py-2 pr-3 text-blue-400">{{ agentDisplayName(s) }}</td>
-              <td class="py-2 pr-3 text-gray-300">{{ accountDisplayName(s) }}</td>
-              <td class="py-2 pr-3">
-                <span :class="chatTypeLabel(s).cls" class="px-2 py-0.5 rounded border text-xs">
-                  {{ chatTypeLabel(s).label }}
-                </span>
-              </td>
-              <td class="py-2 pr-3 text-gray-400 whitespace-nowrap">{{ fmtRel(s.started_at) }}</td>
-              <td class="py-2 pr-3 text-gray-500 whitespace-nowrap">{{ s.ended_at ? fmtRel(s.ended_at) : '—' }}</td>
-              <td class="py-2 pr-3 text-gray-400">{{ s.message_count ?? '—' }}</td>
-              <td class="py-2 pr-3 text-gray-500 max-w-[200px] truncate">{{ s.summary ? truncate(s.summary, 60) : '—' }}</td>
-              <td class="py-2">
-                <span v-if="!s.ended_at"
-                  class="px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400 border border-green-700">
-                  active ✅
-                </span>
-                <span v-else
-                  class="px-2 py-0.5 rounded-full text-xs bg-gray-700/50 text-gray-500 border border-gray-700">
-                  closed
-                </span>
-              </td>
-            </tr>
-            <tr v-if="!filtered.length && !loading">
-              <td colspan="9" class="py-8 text-center text-gray-600">No sessions found</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
-      <!-- Conversation Drawer -->
-      <Teleport to="body">
-        <div v-if="drawer.open"
-             class="fixed inset-0 z-50 flex items-stretch justify-end"
-             @click.self="closeDrawer">
-          <!-- Backdrop -->
-          <div class="absolute inset-0 bg-black/60" @click="closeDrawer"></div>
-          <!-- Panel -->
-          <div class="relative z-10 flex flex-col w-full max-w-2xl bg-gray-950 border-l border-gray-800 shadow-2xl">
-            <!-- Drawer header -->
-            <div class="flex items-start justify-between px-5 py-4 border-b border-gray-800 shrink-0">
-              <div>
-                <div class="text-sm font-semibold text-white leading-tight">{{ drawerTitle(drawer.session) }}</div>
-                <div v-if="drawer.session" class="text-xs text-gray-500 mt-0.5">
-                  {{ drawer.session.message_count ?? 0 }} messages · {{ drawer.session.ended_at ? 'closed' : 'active' }}
-                </div>
-              </div>
-              <button @click="closeDrawer" class="text-gray-500 hover:text-white text-lg leading-none ml-4 shrink-0">✕</button>
-            </div>
-            <!-- Messages -->
-            <div id="sess-msg-scroll" class="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-              <div v-if="drawer.loading" class="text-gray-500 text-xs text-center py-8">Loading messages…</div>
-              <div v-else-if="!drawer.messages.length" class="text-gray-600 text-xs text-center py-8">No messages found</div>
-              <template v-else>
-                <div v-for="(m, i) in drawer.messages" :key="m.id || i"
-                     :class="m.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
-                  <div :class="m.role === 'user'
-                         ? 'bg-blue-600/30 text-blue-100 border border-blue-700/50 rounded-2xl rounded-br-sm'
-                         : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-2xl rounded-bl-sm'"
-                       class="max-w-[80%] px-4 py-2.5 text-xs leading-relaxed">
-                    <div class="text-[10px] opacity-50 mb-1">{{ m.role === 'user' ? (m.account_name || 'User') : 'Assistant' }} · {{ fmtRel(m.created_at) }}</div>
-                    <div class="whitespace-pre-wrap break-words">{{ m.content || '' }}</div>
-                  </div>
-                </div>
-              </template>
-            </div>
-            <!-- Drawer action bar -->
-            <div v-if="drawer.session" class="px-5 py-3 border-t border-gray-800 shrink-0 flex items-center gap-2">
-              <div v-if="actionState.success" class="text-xs text-green-400 flex-1">{{ actionState.success }}</div>
-              <div v-else-if="actionState.error" class="text-xs text-red-400 flex-1">{{ actionState.error }}</div>
-              <div v-else class="flex-1"></div>
-              <button @click="resumeSession(drawer.session)" :disabled="actionState.busy || !drawer.session.ended_at"
-                class="px-3 py-1.5 text-xs rounded bg-blue-600/20 text-blue-400 border border-blue-700 hover:bg-blue-600/40 transition-colors disabled:opacity-40">
-                {{ actionState.busy ? '…' : 'Resume' }}
-              </button>
-              <button @click="resetSession(drawer.session)" :disabled="actionState.busy"
-                class="px-3 py-1.5 text-xs rounded bg-red-600/20 text-red-400 border border-red-700 hover:bg-red-600/40 transition-colors disabled:opacity-40">
-                {{ actionState.busy ? '…' : 'Reset' }}
-              </button>
-            </div>
-          </div>
-        </div>
-      </Teleport>
-    </div>
-  `,
-};
-
-// ─── Reports ─────────────────────────────────────────────────────────────────
-const Reports = {
-  setup() {
-    const { ref, onMounted, computed } = Vue;
-    const heatmap = ref(null);
-    const loading = ref(true);
-    const tooltip = ref(null);
-
-    const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    const FULL_DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-    const hours = Array.from({ length: 24 }, (_, i) => i);
-
-    async function load() {
-      loading.value = true;
-      try {
-        const r = await fetch('/api/reports/session-heatmap');
-        const d = await r.json();
-        heatmap.value = d.error ? null : (d.heatmap || []);
-      } catch {}
-      loading.value = false;
-    }
-
-    onMounted(load);
-
-    const grid = computed(() => {
-      const g = {};
-      for (let d = 0; d < 7; d++) { g[d] = {}; for (let h = 0; h < 24; h++) g[d][h] = 0; }
-      if (heatmap.value) for (const row of heatmap.value) g[row.day_of_week][row.hour] = row.message_count;
-      return g;
-    });
-
-    const maxCount = computed(() => {
-      if (!heatmap.value || !heatmap.value.length) return 1;
-      return Math.max(1, ...heatmap.value.map(r => r.message_count));
-    });
-
-    function cellColor(count) {
-      if (!count) return '#111827';
-      const ratio = count / maxCount.value;
-      if (ratio < 0.2) return '#1e1b4b';
-      if (ratio < 0.4) return '#312e81';
-      if (ratio < 0.6) return '#4338ca';
-      if (ratio < 0.8) return '#6366f1';
-      return '#a5b4fc';
-    }
-
-    function showTooltip(event, day, hour, count) {
-      const label = `${FULL_DAYS[day]} ${String(hour).padStart(2,'0')}:00`;
-      tooltip.value = { text: `${label} — ${count} message${count !== 1 ? 's' : ''}`, x: event.clientX, y: event.clientY };
-    }
-    function hideTooltip() { tooltip.value = null; }
-
-    return { heatmap, loading, load, grid, maxCount, cellColor, showTooltip, hideTooltip, tooltip, DAYS, hours };
-  },
-  template: `
-    <div class="p-6">
-      <div class="flex items-center justify-between mb-6">
-        <h1 class="text-xl font-bold text-white">Reports</h1>
-        <button @click="load" class="text-xs px-3 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 transition-colors">↻ Refresh</button>
-      </div>
-
-      <div v-if="loading" class="text-gray-500 text-xs py-16 text-center">Loading analytics…</div>
-
-      <div v-else-if="!heatmap" class="text-gray-600 text-xs py-16 text-center">
-        Could not load reports — proxy may be offline.
-      </div>
-
-      <template v-else>
-
-        <!-- Session Activity Heatmap -->
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5">
-          <div class="mb-4">
-            <h2 class="text-sm font-semibold text-gray-300">Session Activity Heatmap — Last 30 Days (Manila time)</h2>
-            <p class="text-xs text-gray-600 mt-0.5">Darker = more messages</p>
-          </div>
-
-          <!-- Day labels -->
-          <div class="flex" style="margin-left: 42px;">
-            <div v-for="day in DAYS" :key="day"
-                 class="text-xs text-gray-500 text-center font-medium"
-                 style="flex: 1; min-width: 0;">{{ day }}</div>
-          </div>
-
-          <!-- Hour rows -->
-          <div class="mt-1">
-            <div v-for="hour in hours" :key="hour" class="flex items-center" style="height: 18px; margin-bottom: 1px;">
-              <div class="text-right shrink-0 font-mono" style="width: 38px; margin-right: 4px; font-size: 10px; color: #4b5563;">
-                <span v-if="hour % 6 === 0">{{ String(hour).padStart(2,'0') + ':00' }}</span>
-              </div>
-              <div v-for="day in [0,1,2,3,4,5,6]" :key="day"
-                   style="flex: 1; min-width: 0; height: 17px; border-radius: 2px; cursor: pointer; margin: 0 1px; transition: opacity 0.15s;"
-                   :style="{ backgroundColor: cellColor(grid[day][hour]) }"
-                   @mouseenter="showTooltip($event, day, hour, grid[day][hour])"
-                   @mouseleave="hideTooltip"
-                   @mousemove="showTooltip($event, day, hour, grid[day][hour])">
-              </div>
-            </div>
-          </div>
-
-          <!-- Legend -->
-          <div class="flex items-center gap-2 mt-3 justify-end">
-            <span class="text-xs text-gray-600">Less</span>
-            <div v-for="c in ['#111827','#1e1b4b','#312e81','#4338ca','#6366f1','#a5b4fc']" :key="c"
-                 :style="{ backgroundColor: c, width: '14px', height: '14px', borderRadius: '2px', flexShrink: 0 }"></div>
-            <span class="text-xs text-gray-600">More</span>
-          </div>
-        </div>
-
-      </template>
-
-      <!-- Tooltip -->
-      <teleport to="body">
-        <div v-if="tooltip"
-             class="fixed z-50 pointer-events-none px-2.5 py-1.5 rounded-lg text-xs text-white bg-gray-800 border border-gray-700 shadow-lg"
-             :style="{ left: (tooltip.x + 12) + 'px', top: (tooltip.y - 36) + 'px' }">
-          {{ tooltip.text }}
-        </div>
-      </teleport>
     </div>
   `,
 };
@@ -4367,9 +3749,7 @@ const routes = [
   { path: '/',              redirect: '/dashboard' },
   { path: '/dashboard',     component: Dashboard },
   { path: '/memories',      component: Memories },
-  { path: '/conversations', redirect: '/sessions' },
-  { path: '/sessions',      component: Sessions },
-  { path: '/reports',       component: Reports },
+  { path: '/conversations', component: Conversations },
   { path: '/handoffs',      component: Handoffs },
   { path: '/tasks',         component: Tasks },
   { path: '/knowledge',     component: Knowledge },
@@ -4392,27 +3772,16 @@ const App = {
     const route = VueRouter.useRoute();
 
     const NAV = [
-      { path: '/dashboard',     label: 'Dashboard',     duoIcon: 'dashboard'      },
-      { path: '/memories',      label: 'Memories',      duoIcon: 'chip'           },
-      { path: '/sessions',      label: 'Sessions',      duoIcon: 'message_2'      },
-      { path: '/reports',       label: 'Reports',       duoIcon: 'chart_pie'      },
-      { path: '/handoffs',      label: 'Handoffs',      duoIcon: 'compass'        },
-      { path: '/tasks',         label: 'Tasks',         duoIcon: 'check_circle'   },
-      { path: '/knowledge',     label: 'Knowledge',     duoIcon: 'book_2'         },
-      { path: '/accounts',      label: 'Accounts',      duoIcon: 'user_card'      },
-      { path: '/skills',        label: 'Skills',        duoIcon: 'rocket'         },
-      { path: '/settings',      label: 'Settings',      duoIcon: 'settings'       },
+      { path: '/dashboard',     label: 'Dashboard',     icon: '📊' },
+      { path: '/memories',      label: 'Memories',      icon: '🧠' },
+      { path: '/conversations', label: 'Conversations', icon: '💬' },
+      { path: '/handoffs',      label: 'Handoffs',      icon: '🔀' },
+      { path: '/tasks',         label: 'Tasks',         icon: '✓' },
+      { path: '/knowledge',     label: 'Knowledge',     icon: '📚' },
+      { path: '/accounts',      label: 'Accounts',      icon: '👤' },
+      { path: '/skills',        label: 'Skills',        icon: '⚡' },
+      { path: '/settings',      label: 'Settings',      icon: '⚙️' },
     ];
-    function getDuoIcon(name) {
-      // Returns a placeholder; createIcons() will replace it with SVG
-      return `<i data-duo-icons="${name}" class="text-lg leading-none"></i>`;
-    }
-    // Re-run createIcons on every Vue update so new nav items get rendered
-    function runDuoIcons() {
-      if (window.DuoIcons?.createIcons) {
-        window.DuoIcons.createIcons({ attributes: { width: '18', height: '18' } });
-      }
-    }
 
     function isActive(path) {
       return route.path === path || (path.length > 1 && route.path.startsWith(path));
@@ -4514,7 +3883,7 @@ const App = {
       openAgentAction(inst, action);
     }
 
-    return { NAV, isActive, getDuoIcon, state, drawer, agentsDrawer, agentConfigDrawer, openAgentConfig, saveAgentConfig, sendDrawerMessage, drawerKeydown, fmtDate, toggleAgent, highlightJson, renderMd, spawnDrawer, spawnForm, spawnProgress, doSpawn, plusMenu, orchestrateDrawer, sendOrchestrate, createSkillDrawer, agentActionDrawer, openAgentAction, confirmAgentAction, doDecommission, saveProviderConfig, PROVIDER_MODELS, restartAll, restartAllDrawer };
+    return { NAV, isActive, state, drawer, agentsDrawer, agentConfigDrawer, openAgentConfig, saveAgentConfig, sendDrawerMessage, drawerKeydown, fmtDate, toggleAgent, highlightJson, renderMd, spawnDrawer, spawnForm, spawnProgress, doSpawn, plusMenu, orchestrateDrawer, sendOrchestrate, createSkillDrawer, agentActionDrawer, openAgentAction, confirmAgentAction, doDecommission, saveProviderConfig, PROVIDER_MODELS, modelLabel, modelBadgeClass, restartAll, restartAllDrawer };
   },
   template: `
     <!-- Sidebar -->
@@ -4529,7 +3898,7 @@ const App = {
                      :class="isActive(n.path)
                        ? 'bg-gray-800 text-white'
                        : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/50'">
-          <span :class="`duo-icons-${n.duoIcon}`" style="width:18px;height:18px;font-size:18px;"></span>
+          <span class="w-5 text-center text-base leading-none">{{ n.icon }}</span>
           <span>{{ n.label }}</span>
         </router-link>
       </nav>
@@ -4662,8 +4031,8 @@ const App = {
                 <div class="text-gray-500 text-xs font-mono">{{ agentConfigDrawer.id }}</div>
               </div>
               <span class="px-2 py-0.5 rounded-full text-[10px] font-medium ml-1"
-                :class="agentConfigDrawer.provider === 'openai' ? 'bg-green-900/50 text-green-300' : agentConfigDrawer.provider === 'openrouter' ? 'bg-cyan-900/50 text-cyan-300' : agentConfigDrawer.provider === 'ollama' ? 'bg-orange-900/50 text-orange-300' : agentConfigDrawer.model?.includes('sonnet') ? 'bg-purple-900/50 text-purple-300' : agentConfigDrawer.model?.includes('opus') ? 'bg-amber-900/50 text-amber-300' : 'bg-blue-900/50 text-blue-300'">
-                {{ agentConfigDrawer.provider !== 'anthropic' ? agentConfigDrawer.provider : (agentConfigDrawer.model?.includes('sonnet') ? 'sonnet' : agentConfigDrawer.model?.includes('opus') ? 'opus' : 'haiku') }}
+                :class="agentConfigDrawer.provider === 'openai' ? 'bg-green-900/50 text-green-300' : agentConfigDrawer.provider === 'openrouter' ? 'bg-cyan-900/50 text-cyan-300' : agentConfigDrawer.provider === 'ollama' ? 'bg-orange-900/50 text-orange-300' : modelBadgeClass(agentConfigDrawer.model)">
+                {{ modelLabel(agentConfigDrawer.model) || agentConfigDrawer.provider }}
               </span>
             </div>
             <div class="flex items-center gap-2">
@@ -5102,23 +4471,11 @@ const App = {
            class="fixed top-0 right-0 h-full w-[420px] bg-gray-950 border-l border-gray-800 flex flex-col z-30 shadow-2xl">
         <!-- Header -->
         <div class="flex items-center justify-between px-4 py-3 border-b border-gray-800 shrink-0">
-          <div class="flex-1 min-w-0">
-            <div class="text-sm font-semibold text-gray-200 truncate">
-              {{ drawer.conv?.title || drawer.conv?.platform_conversation_id || 'Conversation' }}
-            </div>
-            <div v-if="drawer.session" class="flex items-center gap-2 mt-0.5">
-              <span v-if="!drawer.session.ended_at"
-                class="px-2 py-0.5 rounded-full text-[10px] bg-green-500/20 text-green-400 border border-green-700">
-                Session #{{ drawer.session.session_number || '?' }} ✅ · started {{ fmtDate(drawer.session.started_at) }} · {{ drawer.session.message_count ?? 0 }} msgs
-              </span>
-              <span v-else
-                class="px-2 py-0.5 rounded-full text-[10px] bg-gray-700/50 text-gray-500 border border-gray-700">
-                Session #{{ drawer.session.session_number || '?' }} · {{ fmtDate(drawer.session.started_at) }} · {{ drawer.session.message_count ?? 0 }} msgs
-              </span>
-            </div>
+          <div class="text-sm font-semibold text-gray-200 truncate">
+            {{ drawer.conv?.title || drawer.conv?.platform_conversation_id || 'Conversation' }}
           </div>
           <button @click="drawer.open = false"
-                  class="text-gray-500 hover:text-gray-200 transition-colors text-lg leading-none ml-2">✕</button>
+                  class="text-gray-500 hover:text-gray-200 transition-colors text-lg leading-none">✕</button>
         </div>
         <!-- Messages -->
         <div id="drawer-messages" class="flex-1 overflow-y-auto px-4 py-4 space-y-3">
@@ -5160,9 +4517,6 @@ const App = {
 const app = Vue.createApp(App);
 app.use(router);
 app.mount('#app');
-// Run DuoIcons after mount and on each route change
-nextTick(() => runDuoIcons());
-setInterval(() => runDuoIcons(), 300); // re-scan until icons settle
 </script>
 </body>
 </html>

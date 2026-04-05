@@ -540,6 +540,47 @@ app.delete('/api/accounts/:id/bind', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/accounts/:id/otp — latest pending OTP for this account
+app.get('/api/accounts/:id/otp', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const r = await pgPool.query(`
+      SELECT otp_code, expires_at, attempts_remaining, created_at
+      FROM fleet.otp_verifications
+      WHERE email = (SELECT email FROM fleet.accounts WHERE id = $1)
+        AND org_id = $2
+        AND verified_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `, [id, ORG_ID]);
+    if (!r.rows.length) return res.json({ found: false });
+    res.json({ found: true, ...r.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/accounts/:id/generate-otp — generate OTP via proxy then return it
+app.post('/api/accounts/:id/generate-otp', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const acct = await pgPool.query(`SELECT email FROM fleet.accounts WHERE id=$1 AND org_id=$2`, [id, ORG_ID]);
+    if (!acct.rows.length) return res.status(404).json({ error: 'Account not found' });
+    const { email } = acct.rows[0];
+    await fetch(`http://127.0.0.1:${PROXY_PORT}/fleet-api/pairing/otp/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ org_id: ORG_ID, telegram_id: 'admin-generated', telegram_name: 'Admin', email }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const otp = await pgPool.query(`
+      SELECT otp_code, expires_at, attempts_remaining, created_at
+      FROM fleet.otp_verifications
+      WHERE email = $1 AND org_id = $2 AND verified_at IS NULL
+      ORDER BY created_at DESC LIMIT 1
+    `, [email, ORG_ID]);
+    if (!otp.rows.length) return res.json({ ok: true, found: false });
+    res.json({ ok: true, found: true, ...otp.rows[0] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/bindings — with OTP status
 app.get('/api/bindings', async (req, res) => {
   try {

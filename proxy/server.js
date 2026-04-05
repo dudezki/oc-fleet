@@ -155,6 +155,23 @@ async function getClient() {
 http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
 
+  // ── REST shims ────────────────────────────────────────────────────────────
+  // GET /api/sessions/stats?org_id=  →  POST /fleet-api/session/stats
+  // GET /api/sessions/reports?org_id= →  POST /fleet-api/session/stats
+  if (req.method === 'GET' && (req.url.startsWith('/api/sessions/stats') || req.url.startsWith('/api/sessions/reports'))) {
+    const urlObj = new URL(req.url, 'http://127.0.0.1');
+    const org_id = urlObj.searchParams.get('org_id');
+    const fwd = http.request({ hostname: '127.0.0.1', port: PORT, path: '/fleet-api/session/stats', method: 'POST',
+      headers: { 'Content-Type': 'application/json' } }, fwdRes => {
+      let d = ''; fwdRes.on('data', c => d += c);
+      fwdRes.on('end', () => { res.writeHead(fwdRes.statusCode, CORS); res.end(d); });
+    });
+    fwd.on('error', e => { res.writeHead(502, CORS); res.end(JSON.stringify({ error: e.message })); });
+    fwd.write(JSON.stringify({ org_id }));
+    fwd.end();
+    return;
+  }
+
   const fn = req.url.replace('/fleet-api/', '');
   let body = '';
   req.on('data', c => body += c);
@@ -841,24 +858,51 @@ http.createServer(async (req, res) => {
         }
 
       } else if (fn === 'conversation/history') {
-        const limit = p.limit || 20;
-        const convR = await pg.query(
-          `SELECT id FROM fleet.conversations
-           WHERE org_id = $1 AND agent_id = $2 AND platform = 'telegram' AND platform_conversation_id = $3
-           ORDER BY created_at DESC LIMIT 1`,
-          [p.org_id, p.agent_id, p.telegram_id]
-        );
-        if (convR.rows.length === 0) {
-          result = { conversation_id: null, messages: [] };
-        } else {
-          const conversation_id = convR.rows[0].id;
-          const msgR = await pg.query(
-            `SELECT role, content, created_at FROM fleet.messages
-             WHERE conversation_id = $1
-             ORDER BY created_at DESC LIMIT $2`,
-            [conversation_id, limit]
+        // p: { session_id?, conversation_id?, telegram_id?, agent_id?, org_id, limit? }
+        const limit = p.limit || 100;
+        let whereClause, params;
+        if (p.session_id) {
+          whereClause = "c.session_id = $1";
+          params = [p.session_id, limit];
+        } else if (p.conversation_id) {
+          whereClause = "m.conversation_id = $1";
+          params = [p.conversation_id, limit];
+        } else if (p.telegram_id) {
+          // legacy: lookup by telegram_id + agent_id
+          const convR = await pg.query(
+            `SELECT id FROM fleet.conversations
+             WHERE org_id = $1 AND agent_id = $2 AND platform = 'telegram' AND platform_conversation_id = $3
+             ORDER BY created_at DESC LIMIT 1`,
+            [p.org_id, p.agent_id, p.telegram_id]
           );
-          result = { conversation_id, messages: msgR.rows };
+          if (convR.rows.length === 0) {
+            result = { conversation_id: null, messages: [] };
+          } else {
+            const conversation_id = convR.rows[0].id;
+            const msgR = await pg.query(
+              `SELECT role, content, created_at FROM fleet.messages
+               WHERE conversation_id = $1
+               ORDER BY created_at DESC LIMIT $2`,
+              [conversation_id, limit]
+            );
+            result = { conversation_id, messages: msgR.rows };
+          }
+        } else {
+          result = { error: "session_id, conversation_id, or telegram_id required" };
+        }
+        if (!result) {
+          const r = await pg.query(
+            `SELECT m.id, m.role, m.content, m.created_at, m.platform_message_id,
+                    a.name AS account_name
+             FROM fleet.messages m
+             JOIN fleet.conversations c ON c.id = m.conversation_id
+             LEFT JOIN fleet.telegram_bindings tb ON tb.telegram_id = c.platform_conversation_id AND tb.org_id = c.org_id
+             LEFT JOIN fleet.accounts a ON a.id = tb.account_id
+             WHERE ${whereClause}
+             ORDER BY m.created_at ASC LIMIT $${params.length}`,
+            params
+          );
+          result = { messages: r.rows };
         }
 
       // ── Search: vector similarity search ─────────────────────────────────
@@ -1242,18 +1286,31 @@ http.createServer(async (req, res) => {
 
       // ── Session: list past sessions ─────────────────────────────────────────
       } else if (fn === 'session/list') {
-        // p: { org_id, agent_id, platform_chat_id, limit? }
-        const limit = p.limit || 10;
+        // p: { org_id, agent_id?, platform_chat_id?, limit? }
+        const limit = p.limit || 50;
+        const conditions = ['s.org_id=$1'];
+        const params = [p.org_id];
+        if (p.agent_id) { params.push(p.agent_id); conditions.push(`s.agent_id=$${params.length}`); }
+        if (p.platform_chat_id) { params.push(p.platform_chat_id); conditions.push(`s.platform_chat_id=$${params.length}`); }
+        params.push(limit);
         const r = await pg.query(
           `SELECT s.id, s.session_number, s.started_at, s.ended_at, s.summary,
-                  COUNT(m.id)::int AS message_count
+                  s.chat_type, s.platform_chat_id, s.reset_by,
+                  a.name AS agent_name, a.slug AS agent_slug,
+                  COUNT(m.id)::int AS message_count,
+                  CASE WHEN s.ended_at IS NULL THEN 'active' ELSE 'closed' END AS status,
+                  u.name AS account_name
            FROM fleet.sessions s
+           LEFT JOIN fleet.agents a ON a.id = s.agent_id
            LEFT JOIN fleet.conversations c ON c.session_id = s.id
            LEFT JOIN fleet.messages m ON m.conversation_id = c.id
-           WHERE s.org_id=$1 AND s.agent_id=$2 AND s.platform_chat_id=$3
-           GROUP BY s.id, s.session_number, s.started_at, s.ended_at, s.summary
-           ORDER BY s.started_at DESC LIMIT $4`,
-          [p.org_id, p.agent_id, p.platform_chat_id, limit]
+           LEFT JOIN fleet.telegram_bindings tb ON tb.telegram_id = s.platform_chat_id AND tb.org_id = s.org_id
+           LEFT JOIN fleet.accounts u ON u.id = tb.account_id
+           WHERE ${conditions.join(' AND ')}
+           GROUP BY s.id, s.session_number, s.started_at, s.ended_at, s.summary,
+                    s.chat_type, s.platform_chat_id, s.reset_by, a.name, a.slug, u.name
+           ORDER BY s.started_at DESC LIMIT $${params.length}`,
+          params
         );
         result = { sessions: r.rows };
 
@@ -1295,6 +1352,58 @@ http.createServer(async (req, res) => {
             reactivated: true
           };
         }
+
+      // ── Session: stats ──────────────────────────────────────────────────────────
+      } else if (fn === "session/stats") {
+        // p: { org_id }
+        const statsR = await pg.query(`
+          SELECT
+            COUNT(*)                                          AS total,
+            COUNT(*) FILTER (WHERE ended_at IS NULL)          AS active,
+            COUNT(*) FILTER (WHERE started_at::date = CURRENT_DATE) AS today,
+            ROUND(AVG(msg_counts.cnt), 1)                    AS avg_messages,
+            COUNT(*) FILTER (WHERE chat_type = 'direct')    AS dm_count,
+            COUNT(*) FILTER (WHERE chat_type = 'group')     AS gc_count
+          FROM fleet.sessions s
+          LEFT JOIN (
+            SELECT c.session_id, COUNT(m.id) AS cnt
+            FROM fleet.conversations c
+            JOIN fleet.messages m ON m.conversation_id = c.id
+            GROUP BY c.session_id
+          ) msg_counts ON msg_counts.session_id = s.id
+          WHERE s.org_id = $1
+        `, [p.org_id]);
+
+        const byDayR = await pg.query(`
+          SELECT started_at::date AS day, COUNT(*) AS count
+          FROM fleet.sessions
+          WHERE org_id = $1 AND started_at >= now() - interval '30 days'
+          GROUP BY day ORDER BY day ASC
+        `, [p.org_id]);
+
+        const byAgentR = await pg.query(`
+          SELECT a.name AS agent_name, a.slug, COUNT(s.id) AS session_count,
+            COUNT(s.id) FILTER (WHERE s.ended_at IS NULL) AS active_count
+          FROM fleet.sessions s
+          JOIN fleet.agents a ON a.id = s.agent_id
+          WHERE s.org_id = $1
+          GROUP BY a.id, a.name, a.slug
+          ORDER BY session_count DESC
+        `, [p.org_id]);
+
+        const resetR = await pg.query(`
+          SELECT reset_by, COUNT(*) AS count
+          FROM fleet.sessions
+          WHERE org_id = $1 AND reset_by IS NOT NULL
+          GROUP BY reset_by
+        `, [p.org_id]);
+
+        result = {
+          summary: statsR.rows[0],
+          by_day: byDayR.rows,
+          by_agent: byAgentR.rows,
+          reset_reasons: resetR.rows
+        };
 
       } else {
         result = { error: `Unknown endpoint: ${fn}` };

@@ -2247,6 +2247,22 @@ app.get('/api/sessions/reports', async (req, res) => {
   }
 });
 
+// GET /api/reports/session-heatmap — message volume by day+hour (Manila time, last 30 days)
+app.get('/api/reports/session-heatmap', async (req, res) => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${PROXY_PORT}/fleet-api/session/heatmap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ org_id: ORG_ID }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'Proxy unreachable', detail: err.message });
+  }
+});
+
 // GET /api/agents/:slug/sessions — sessions for a specific agent
 app.get('/api/agents/:slug/sessions', async (req, res) => {
   const { slug } = req.params;
@@ -2269,6 +2285,11 @@ app.get('/api/agents/:slug/sessions', async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: 'Proxy unreachable', detail: err.message });
   }
+});
+
+// Serve duo-icons dist
+app.get('/duo-icons.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'node_modules/duo-icons/dist/index.umd.cjs'));
 });
 
 // SPA fallback — serve index.html for all non-API routes

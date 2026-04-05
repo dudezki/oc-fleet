@@ -4,6 +4,65 @@ const { Client } = require('pg');
 const { processConversation, embedTexts, chunkText } = require('./chunker');
 
 // ── Conversation Summarizer ──────────────────────────────────────────────────
+// ── Handoff status notification ─────────────────────────────────────────────
+async function notifyHandoffUpdate(pg, handoff, status, detail) {
+  const https = require('https');
+  const sendTg = (botToken, chatId, text) => new Promise((resolve) => {
+    const body = JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' });
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${botToken}/sendMessage`,
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+    }, res => { res.on('data', () => {}); res.on('end', resolve); });
+    req.on('error', () => resolve());
+    req.setTimeout(6000, () => { req.destroy(); resolve(); });
+    req.write(body); req.end();
+  });
+
+  const emoji = status === 'accepted' ? '✅' : status === 'rejected' ? '❌' : '🏁';
+  const label = status === 'accepted' ? 'Accepted' : status === 'rejected' ? 'Denied' : 'Completed';
+
+  try {
+    // Get agent names + bot tokens
+    const agentR = await pg.query(
+      `SELECT id, name, slug, bot_token FROM fleet.agents
+       WHERE id IN ($1, $2)`,
+      [handoff.from_agent_id, handoff.to_agent_id]
+    );
+    const agentMap = {};
+    for (const a of agentR.rows) agentMap[a.id] = a;
+    const fromAgent = agentMap[handoff.from_agent_id];
+    const toAgent   = agentMap[handoff.to_agent_id];
+
+    const msgToUser = detail
+      ? `${emoji} *Handoff ${label}*\n\nYour request to ${toAgent?.name || 'the agent'} was ${label.toLowerCase()}.\nReason: ${detail}`
+      : `${emoji} *Handoff ${label}*\n\nYour request has been ${label.toLowerCase()} by ${toAgent?.name || 'the agent'}.`;
+
+    // Notify user via from_agent bot (they know this bot)
+    if (handoff.telegram_id && fromAgent?.bot_token) {
+      await sendTg(fromAgent.bot_token, handoff.telegram_id, msgToUser);
+    }
+
+    // Notify originating agent via hooks/wake
+    if (fromAgent?.id && handoff.from_agent_id !== handoff.to_agent_id) {
+      const hookR = await pg.query(
+        `SELECT gateway_port, hooks_token FROM fleet.agents WHERE id=$1`, [handoff.from_agent_id]
+      );
+      if (hookR.rows[0]?.hooks_token) {
+        const { gateway_port, hooks_token } = hookR.rows[0];
+        const http2 = require('http');
+        const wakeBody = JSON.stringify({ text: `Handoff ${handoff.id.slice(0,8)} was ${label} by ${toAgent?.name || 'agent'}. Summary: ${handoff.summary?.slice(0,100)}`, mode: 'now' });
+        const wreq = http2.request({ hostname: '127.0.0.1', port: gateway_port, path: '/hooks/wake', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(wakeBody), 'Authorization': `Bearer ${hooks_token}` }}, () => {});
+        wreq.on('error', () => {});
+        wreq.write(wakeBody); wreq.end();
+      }
+    }
+  } catch (e) {
+    console.error('[handoff-notify]', e.message);
+  }
+}
+
 async function summarizeConversation(pg, conversationId, totalMessages, anthropicKey) {
   if (!anthropicKey) return { skipped: 'no anthropic key' };
 
@@ -295,37 +354,38 @@ http.createServer(async (req, res) => {
         } else if (p.action === 'accept') {
           const r = await pg.query(
             `UPDATE fleet.handoffs SET status = 'accepted', accepted_at = now(), updated_at = now()
-             WHERE id = $1 RETURNING id, status, accepted_at`,
+             WHERE id = $1 RETURNING id, status, accepted_at, from_agent_id, to_agent_id, user_id, telegram_id, summary`,
             [p.handoff_id]
           );
           result = { handoff: r.rows[0] };
+          // Fire notification back (async)
+          if (r.rows[0]) notifyHandoffUpdate(pg, r.rows[0], 'accepted', null).catch(() => {});
 
         } else if (p.action === 'deny' || p.action === 'reject') {
           // p: { handoff_id, reason? }
           const r = await pg.query(
             `UPDATE fleet.handoffs
-             SET status = 'rejected',
-                 updated_at = now(),
+             SET status = 'rejected', updated_at = now(),
                  current_state = current_state || $2::jsonb
              WHERE id = $1
-             RETURNING id, status, updated_at`,
+             RETURNING id, status, updated_at, from_agent_id, to_agent_id, user_id, telegram_id, summary`,
             [p.handoff_id, JSON.stringify({ rejected_reason: p.reason || 'Denied by agent', rejected_at: new Date().toISOString() })]
           );
           result = { handoff: r.rows[0] };
+          if (r.rows[0]) notifyHandoffUpdate(pg, r.rows[0], 'rejected', p.reason || 'Denied by agent').catch(() => {});
 
         } else if (p.action === 'complete') {
           // p: { handoff_id, summary? }
           const r = await pg.query(
             `UPDATE fleet.handoffs
-             SET status = 'completed',
-                 completed_at = now(),
-                 updated_at = now(),
+             SET status = 'completed', completed_at = now(), updated_at = now(),
                  current_state = current_state || $2::jsonb
              WHERE id = $1
-             RETURNING id, status, completed_at`,
+             RETURNING id, status, completed_at, from_agent_id, to_agent_id, user_id, telegram_id, summary`,
             [p.handoff_id, JSON.stringify({ completion_summary: p.summary || '' })]
           );
           result = { handoff: r.rows[0] };
+          if (r.rows[0]) notifyHandoffUpdate(pg, r.rows[0], 'completed', p.summary || null).catch(() => {});
         }
 
       // ── Pairing: check if telegram user is already bound ─────────────────

@@ -418,13 +418,29 @@ http.createServer(async (req, res) => {
                  (r.rows[0]?.name || p.telegram_id) + ' / ' + p.agent_id.slice(0,8)]
               );
               const conv_id = convR.rows[0].id;
+              // Detect /reset or /start — auto-reset session at proxy level
+              const isReset = p.message && /^\/reset\b/i.test(p.message.trim());
+              const isStart = p.message && /^\/start\b/i.test(p.message.trim());
+
               // Ensure active session exists and link conversation to it
               const pairSessR = await pg.query(
-                `SELECT id FROM fleet.sessions WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`,
+                `SELECT id, session_number FROM fleet.sessions WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`,
                 [p.agent_id, p.telegram_id]
               );
               let pairSessionId;
-              if (pairSessR.rows.length > 0) {
+              if (isReset && pairSessR.rows.length > 0) {
+                // Close current session and open new one on /reset
+                await pg.query(
+                  `UPDATE fleet.sessions SET ended_at=now(), reset_by='user', updated_at=now() WHERE id=$1`,
+                  [pairSessR.rows[0].id]
+                );
+                const newSess = await pg.query(
+                  `INSERT INTO fleet.sessions (org_id, agent_id, platform_chat_id, chat_type) VALUES ($1,$2,$3,'direct') RETURNING id, session_number`,
+                  [p.org_id, p.agent_id, p.telegram_id]
+                );
+                pairSessionId = newSess.rows[0].id;
+                console.log(`[proxy] /reset: closed session, opened #${newSess.rows[0].session_number} for ${p.telegram_id}`);
+              } else if (pairSessR.rows.length > 0) {
                 pairSessionId = pairSessR.rows[0].id;
               } else {
                 const pairNewSess = await pg.query(

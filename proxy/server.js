@@ -1495,18 +1495,23 @@ http.createServer(async (req, res) => {
 
       // ── Session: heatmap ─────────────────────────────────────────────────────
       } else if (fn === "session/heatmap") {
-        // p: { org_id }
+        // p: { org_id } — returns current week + previous week split
         const r = await pg.query(`
           SELECT
             EXTRACT(DOW FROM m.created_at AT TIME ZONE 'Asia/Manila')::int AS day_of_week,
             EXTRACT(HOUR FROM m.created_at AT TIME ZONE 'Asia/Manila')::int AS hour,
-            COUNT(*)::int AS message_count
+            COUNT(*)::int AS message_count,
+            CASE
+              WHEN m.created_at AT TIME ZONE 'Asia/Manila' >= date_trunc('week', now() AT TIME ZONE 'Asia/Manila')
+              THEN 'current'
+              ELSE 'previous'
+            END AS week
           FROM fleet.messages m
           JOIN fleet.conversations c ON c.id = m.conversation_id
           WHERE c.org_id = $1
-            AND m.created_at >= now() - interval '30 days'
-          GROUP BY day_of_week, hour
-          ORDER BY day_of_week, hour
+            AND m.created_at >= date_trunc('week', now() AT TIME ZONE 'Asia/Manila') - interval '7 days'
+          GROUP BY day_of_week, hour, week
+          ORDER BY week, day_of_week, hour
         `, [p.org_id]);
         result = { heatmap: r.rows };
 

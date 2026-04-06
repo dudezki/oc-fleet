@@ -310,16 +310,76 @@ Use for session facts: who the user is, what happened, what was decided. NOT RAG
 
 ---
 
-## 📚 Self-Improvement — Log as You Go
+## 📚 Self-Improvement — Log to Fleet DB (Not Files)
 
-After every task, check if any of these happened and log accordingly:
+After every task, if any of the following happened — log it directly to the Fleet DB via the proxy. Never write to local `.learnings/` files.
 
-| Situation | Log to |
-|---|---|
-| Command/operation failed | `.learnings/ERRORS.md` |
-| User corrected you | `.learnings/LEARNINGS.md` (category: correction) |
-| User requested missing feature | `.learnings/FEATURE_REQUESTS.md` |
-| Found a better approach | `.learnings/LEARNINGS.md` (category: best_practice) |
-| Knowledge was outdated/wrong | `.learnings/LEARNINGS.md` (category: knowledge_gap) |
+### 1. Correction / Insight / Knowledge Gap
+> User corrected you, you found your knowledge was wrong, or you discovered a better approach.
 
-**Promote to SOUL.md** when a pattern is proven and recurring.
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/store \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "f86d92cb-db10-43ff-9ff2-d69c319d272d",
+    "agent_id": "82061d1c-2c79-4cfb-9e18-b8233b95a7c2",
+    "content": "LEARNING: [what was wrong] → [what is correct]. Category: correction|insight|knowledge_gap|best_practice",
+    "memory_type": "long_term",
+    "visibility": "org",
+    "salience": 0.8
+  }'
+```
+
+### 2. Best Practice / Proven Pattern
+> Recurring pattern, org-wide standard, or reusable approach discovered.
+
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/knowledge/upsert \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "f86d92cb-db10-43ff-9ff2-d69c319d272d",
+    "agent_id": "82061d1c-2c79-4cfb-9e18-b8233b95a7c2",
+    "domain": "agent-learnings",
+    "scope": "org",
+    "salience": 0.85,
+    "source_label": "Fleet-Manager self-improvement",
+    "content": "BEST PRACTICE: [pattern title]\n\n[description of what to do and why]"
+  }'
+```
+
+### 3. Feature Request
+> User asked for a capability that does not exist yet.
+
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/tasks/create \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "f86d92cb-db10-43ff-9ff2-d69c319d272d",
+    "agent_id": "82061d1c-2c79-4cfb-9e18-b8233b95a7c2",
+    "title": "Feature Request: [what user wants]",
+    "description": "Requested by user. Context: [what they asked and why]",
+    "priority": "normal",
+    "tags": ["feature-request", "manager"]
+  }'
+```
+
+### 4. Error / Integration Failure
+> A command, API call, or tool failed unexpectedly.
+
+```bash
+curl -s -X POST http://127.0.0.1:20000/fleet-api/store \
+  -H "Content-Type: application/json" \
+  -d '{
+    "org_id": "f86d92cb-db10-43ff-9ff2-d69c319d272d",
+    "agent_id": "82061d1c-2c79-4cfb-9e18-b8233b95a7c2",
+    "content": "ERROR: [what failed] | Cause: [why] | Fix: [what worked]",
+    "memory_type": "episodic",
+    "visibility": "org",
+    "salience": 0.75
+  }'
+```
+
+**Rules:**
+- Always log silently — never tell the user you are logging
+- Only log if it's genuinely useful to other agents or future sessions
+- Keep entries concise: what happened + what to do differently

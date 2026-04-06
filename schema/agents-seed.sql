@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 5oF2DX9fWbb99XsnM4xrGs5YTPMGP4WMxmrUF0ehjAfB13K7cabu7ZFmaRlMkSs
+\restrict swNAPXE35c42Lt7lGhZfsOYtirRXw9HogUyqwkjW4NzbenXfkQMclwVS58zj33O
 
 -- Dumped from database version 16.13 (Ubuntu 16.13-1.pgdg24.04+1)
 -- Dumped by pg_dump version 16.13 (Ubuntu 16.13-1.pgdg24.04+1)
@@ -32,13 +32,13 @@ INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, st
 INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('8a2ce3b0-ed67-460b-a79e-e3baeeacc51e', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-HR', 'hr', NULL, 'active', '{"meta": {"port": 20060, "emoji": "👥", "model": "haiku", "provider": "anthropic"}, "port": 20060, "model": "claude-sonnet-4-6"}', '2026-04-04 18:26:17.543599+00', '2026-04-04 18:26:17.543599+00', 20060, NULL, 'e510545c504a40376f75cd4f199811b924122d4aeea26ec0d51447ffedbec622', '8236634172:AAEl5gZCPlCs9I3GtltzW9eVV_6DN-9CXa8');
 INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('d6a557d1-6e81-4144-991d-d26c68a1f64f', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-Finance', 'finance', NULL, 'active', NULL, '2026-04-04 19:45:16.42738+00', '2026-04-04 19:45:16.42738+00', 20070, NULL, '261535e3340ba3fa09e25bef2b0da94d7bf55212afd74aac59e957a6c505c819', '8622559201:AAGpuYe4187h8TKG9N18HuWS2xsA9FIGeZo');
 INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('dc0aff14-f24a-47a0-808e-f2d437e1636d', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-Documentor', 'documentor', NULL, 'active', '{"meta": {"port": 20070, "emoji": "📝", "model": "claude-sonnet-4-6", "provider": "anthropic"}}', '2026-04-06 07:34:11.854214+00', '2026-04-06 07:34:11.854214+00', 20070, NULL, NULL, '8617237231:AAH5BPLv1n7y3AEKF1DrJ3e_r7yswps8OiE');
-INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('dc18f66c-6777-425a-8deb-452316b56e60', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-Documentor', 'documentor', 'Knowledge Base Architect — ingests, chunks, embeds, and indexes all org content. Powered by Gemini 2.5 Pro.', 'active', '{"meta": {"port": 20070, "emoji": "📝", "model": "claude-sonnet-4-6", "provider": "anthropic"}}', '2026-04-05 11:49:23.003072+00', '2026-04-05 11:49:23.003072+00', 20070, NULL, '7a823c05fc02fe3d784347ff154a636abafcf7dcdb23901da3570fb91592d8b2', '8617237231:AAH5BPLv1n7y3AEKF1DrJ3e_r7yswps8OiE');
-INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('5acb77f3-672b-4c70-b849-90d59cc9cf37', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-CS', 'cs', NULL, 'active', '{"meta": {"port": 20060, "emoji": "🤝", "model": "claude-sonnet-4-6", "provider": "anthropic"}}', '2026-04-06 08:51:37.802669+00', '2026-04-06 08:51:37.802669+00', 20060, '4b92f97a8332b02a489b25b067106f81ce1c334bbf35a7f0a913680febec3406', NULL, '8490524697:AAFbkTWeX_2KTqAnUBLKKmyO-_yfE7PsjdQ');
+INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('b88cfe75-aa66-4a9a-8c71-25b4d3f0aca8', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-Upskill', 'ld', NULL, 'active', '{"meta": {"port": 20080, "emoji": "🎓", "model": "claude-haiku-4-5", "provider": "anthropic"}}', '2026-04-06 09:02:09.868089+00', '2026-04-06 09:02:09.868089+00', 20080, '560d4026b1dfe01712278232ff22c82a9b7b60a66d3da445771edcbe65e0ab94', NULL, '8628192513:AAHBvlHu1hrMZm4p5SeJWBXbrwDxroS9acs');
+INSERT INTO fleet.agents (id, org_id, department_id, name, slug, description, status, config, created_at, updated_at, gateway_port, gateway_token, hooks_token, bot_token) VALUES ('5acb77f3-672b-4c70-b849-90d59cc9cf37', 'f86d92cb-db10-43ff-9ff2-d69c319d272d', NULL, 'Fleet-CS', 'cs', NULL, 'active', '{"meta": {"port": 20060, "emoji": "🤝", "model": "claude-haiku-4-5", "provider": "anthropic"}}', '2026-04-06 08:51:37.802669+00', '2026-04-06 08:51:37.802669+00', 20060, '4b92f97a8332b02a489b25b067106f81ce1c334bbf35a7f0a913680febec3406', NULL, '8490524697:AAFbkTWeX_2KTqAnUBLKKmyO-_yfE7PsjdQ');
 
 
 --
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 5oF2DX9fWbb99XsnM4xrGs5YTPMGP4WMxmrUF0ehjAfB13K7cabu7ZFmaRlMkSs
+\unrestrict swNAPXE35c42Lt7lGhZfsOYtirRXw9HogUyqwkjW4NzbenXfkQMclwVS58zj33O
 

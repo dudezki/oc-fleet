@@ -38,7 +38,7 @@ async function getInstances() {
         } catch { return null; }
       })();
       const meta = a.config?.meta || {};
-      return { name: a.slug, displayName: a.name, id: a.id, port, home: 'cbfleet-rag-' + a.slug, model: meta.model || 'haiku', provider: meta.provider || 'anthropic', emoji: meta.emoji || '🤖' };
+      return { name: a.slug, displayName: a.name, id: a.id, port, home: 'cbfleet-rag-' + a.slug, model: meta.model || null, provider: meta.provider || 'anthropic', emoji: meta.emoji || '🤖' };
     }).filter(i => i.port);
   } catch {
     return [
@@ -1676,7 +1676,7 @@ app.get('/api/agents', async (req, res) => {
       return {
         id: a.id, name: a.name, slug: a.slug, status: a.status,
         emoji: meta.emoji || '🤖',
-        model: meta.model || 'haiku',
+        model: meta.model || null,
         provider: meta.provider || 'anthropic',
         port,
         health,
@@ -1960,7 +1960,7 @@ app.get('/api/agents/:slug', async (req, res) => {
       description: a.description || null,
       created_at: a.created_at,
       emoji: meta.emoji || '🤖',
-      model: meta.model || 'haiku',
+      model: meta.model || null,
       provider: meta.provider || 'anthropic',
       port: meta.port || null,
       health,
@@ -2104,6 +2104,32 @@ app.post('/api/agents/decommission', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// GET /api/reports/session-heatmap — 30-day activity heatmap (day × hour)
+app.get('/api/reports/session-heatmap', async (req, res) => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${PROXY_PORT}/fleet-api/session/heatmap`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ org_id: ORG_ID }),
+      signal: AbortSignal.timeout(8000),
+    });
+    res.json(await response.json());
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/reports/session-stats — 30-day session summary + by_day + by_agent
+app.get('/api/reports/session-stats', async (req, res) => {
+  try {
+    const response = await fetch(`http://127.0.0.1:${PROXY_PORT}/fleet-api/session/stats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ org_id: ORG_ID }),
+      signal: AbortSignal.timeout(8000),
+    });
+    res.json(await response.json());
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // SPA fallback — serve index.html for all non-API routes

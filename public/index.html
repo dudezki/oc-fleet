@@ -158,7 +158,7 @@ async function getAgentMeta() {
     const agents = await r.json();
     _agentMetaCache = {};
     for (const a of agents) {
-      _agentMetaCache[a.slug] = { id: a.id, emoji: a.emoji || '🤖', model: a.model || 'haiku' };
+      _agentMetaCache[a.slug] = { id: a.id, emoji: a.emoji || '🤖', model: a.model || null };
     }
   } catch { _agentMetaCache = {}; }
   return _agentMetaCache;
@@ -204,7 +204,7 @@ function modelLabel(model) {
   if (m.includes('gemini-2.5-flash')) return 'gemini-2.5-flash';
   if (m.includes('gemini-2.0')) return 'gemini-2.0-flash';
   if (m.includes('gemini-3.1-pro')) return 'gemini-3.1-pro';
-  if (m.includes('gemini')) return 'gemini';
+  if (m.includes('gemini')) { const v = m.match(/gemini-(\d+\.\d+)/); return v ? `gemini-${v[1]}` : 'gemini'; }
   if (m.includes('sonnet')) return 'sonnet';
   if (m.includes('opus')) return 'opus';
   if (m.includes('haiku')) return 'haiku';
@@ -214,8 +214,7 @@ function modelLabel(model) {
 
 function modelBadgeClass(model) {
   const m = String(model || '');
-  if (m.includes('gemini-2.5-pro') || m.includes('gemini-3.1-pro')) return 'bg-blue-900/50 text-blue-300';
-  if (m.includes('gemini')) return 'bg-cyan-900/50 text-cyan-300';
+  if (m.includes('gemini')) return 'bg-blue-900/50 text-blue-300';
   if (m.includes('opus')) return 'bg-yellow-900/50 text-yellow-300';
   if (m.includes('sonnet')) return 'bg-purple-900/50 text-purple-300';
   return 'bg-slate-700/50 text-slate-300';
@@ -3866,6 +3865,136 @@ const AgentProfile = {
 };
 
 // ─── Router ───────────────────────────────────────────────────────────────────
+// ─── Reports ──────────────────────────────────────────────────────────────────
+const Reports = {
+  setup() {
+    const { ref, computed, onMounted } = Vue;
+    const heatmap = ref([]);
+    const stats = ref(null);
+    const loading = ref(true);
+    const error = ref('');
+
+    const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+    const grid = computed(() => {
+      const map = {};
+      let max = 0;
+      for (const r of heatmap.value) {
+        map[`${r.day_of_week}-${r.hour}`] = r.message_count;
+        if (r.message_count > max) max = r.message_count;
+      }
+      const rows = [];
+      for (let d = 0; d < 7; d++) {
+        const cells = [];
+        for (let h = 0; h < 24; h++) {
+          const v = map[`${d}-${h}`] || 0;
+          cells.push({ hour: h, value: v, intensity: max ? v / max : 0 });
+        }
+        rows.push({ day: DAYS[d], cells });
+      }
+      return { rows, max };
+    });
+
+    function cellColor(intensity) {
+      if (intensity === 0) return '#1f2937';
+      return `rgba(59,130,246,${(0.15 + intensity * 0.85).toFixed(2)})`;
+    }
+
+    onMounted(async () => {
+      try {
+        const [hRes, sRes] = await Promise.allSettled([
+          fetch('/api/reports/session-heatmap'),
+          fetch('/api/reports/session-stats'),
+        ]);
+        if (hRes.status === 'fulfilled' && hRes.value.ok) {
+          const d = await hRes.value.json();
+          heatmap.value = d.heatmap || [];
+        }
+        if (sRes.status === 'fulfilled' && sRes.value.ok) {
+          stats.value = await sRes.value.json();
+        }
+      } catch (e) { error.value = e.message; }
+      loading.value = false;
+    });
+
+    return { loading, error, grid, stats, cellColor, DAYS };
+  },
+  template: `
+    <div class="p-6">
+      <h1 class="text-xl font-bold mb-6 text-white">Reports</h1>
+      <div v-if="loading" class="text-gray-500 text-sm">Loading…</div>
+      <div v-else-if="error" class="text-red-400 text-sm">{{ error }}</div>
+      <div v-else>
+        <!-- Stats cards -->
+        <div v-if="stats && stats.summary" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-gray-500 text-xs mb-1">Total Sessions</div>
+            <div class="text-2xl font-bold text-white">{{ stats.summary.total ?? '—' }}</div>
+          </div>
+          <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-gray-500 text-xs mb-1">Today</div>
+            <div class="text-2xl font-bold text-white">{{ stats.summary.today ?? '—' }}</div>
+          </div>
+          <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-gray-500 text-xs mb-1">Avg Messages</div>
+            <div class="text-2xl font-bold text-white">{{ stats.summary.avg_messages ? Number(stats.summary.avg_messages).toFixed(1) : '—' }}</div>
+          </div>
+          <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div class="text-gray-500 text-xs mb-1">DM / GC</div>
+            <div class="text-2xl font-bold text-white">{{ stats.summary.dm_count ?? '—' }} / {{ stats.summary.gc_count ?? '—' }}</div>
+          </div>
+        </div>
+
+        <!-- Activity Heatmap -->
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-6">
+          <h2 class="text-sm font-semibold text-gray-300 mb-4">Activity Heatmap <span class="text-gray-600 font-normal text-xs">(last 30 days · Asia/Manila)</span></h2>
+          <div v-if="!grid.max" class="text-gray-600 text-xs py-4">No heatmap data</div>
+          <div v-else class="overflow-x-auto">
+            <table class="text-[10px] border-separate border-spacing-0.5">
+              <thead>
+                <tr>
+                  <th class="w-8 text-gray-600 font-normal pr-1"></th>
+                  <th v-for="h in 24" :key="h" class="w-5 text-gray-600 font-normal text-center">{{ String(h-1).padStart(2,'0') }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in grid.rows" :key="row.day">
+                  <td class="text-gray-500 pr-2 font-mono whitespace-nowrap">{{ row.day }}</td>
+                  <td v-for="cell in row.cells" :key="cell.hour"
+                      class="w-5 h-4 rounded-sm cursor-default"
+                      :style="{ background: cellColor(cell.intensity) }"
+                      :title="row.day + ' ' + String(cell.hour).padStart(2,'0') + ':00 — ' + cell.value + ' msg' + (cell.value!==1?'s':'')">
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div class="flex items-center gap-1 mt-3 text-[10px] text-gray-500">
+              <span class="mr-1">Less</span>
+              <div v-for="i in [0, 0.25, 0.5, 0.75, 1]" :key="i" class="w-4 h-3 rounded-sm" :style="{ background: cellColor(i) }"></div>
+              <span class="ml-1">More</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- By agent -->
+        <div v-if="stats && stats.by_agent && stats.by_agent.length" class="bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <h2 class="text-sm font-semibold text-gray-300 mb-4">Sessions by Agent</h2>
+          <div class="space-y-2">
+            <div v-for="a in stats.by_agent" :key="a.agent_name" class="flex items-center gap-3">
+              <span class="text-gray-400 text-xs w-32 truncate">{{ a.agent_name || 'Unknown' }}</span>
+              <div class="flex-1 bg-gray-800 rounded-full h-1.5 overflow-hidden">
+                <div class="h-full bg-blue-500 rounded-full"
+                     :style="{ width: (stats.by_agent[0]?.count ? (a.count/stats.by_agent[0].count*100) : 0)+'%' }"></div>
+              </div>
+              <span class="text-gray-500 text-xs w-8 text-right">{{ a.count }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  `,
+};
+
 const routes = [
   { path: '/',              redirect: '/dashboard' },
   { path: '/dashboard',     component: Dashboard },
@@ -3877,6 +4006,7 @@ const routes = [
   { path: '/accounts',      component: Accounts },
   { path: '/accounts/:id',  component: AccountProfile },
   { path: '/skills',        component: Skills },
+  { path: '/reports',       component: Reports },
   { path: '/settings',      component: Settings },
   { path: '/agents/:slug',  component: AgentProfile },
 
@@ -3901,6 +4031,7 @@ const App = {
       { path: '/knowledge',     label: 'Knowledge',     icon: '📚' },
       { path: '/accounts',      label: 'Accounts',      icon: '👤' },
       { path: '/skills',        label: 'Skills',        icon: '⚡' },
+      { path: '/reports',       label: 'Reports',       icon: '📈' },
       { path: '/settings',      label: 'Settings',      icon: '⚙️' },
     ];
 

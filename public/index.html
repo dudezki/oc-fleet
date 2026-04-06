@@ -3864,6 +3864,308 @@ const AgentProfile = {
   `,
 };
 
+// ─── Sessions ────────────────────────────────────────────────────────────────
+const Sessions = {
+  setup() {
+    const sessions     = Vue.ref([]);
+    const loading      = Vue.ref(true);
+    const filterAgent  = Vue.ref('');
+    const filterType   = Vue.ref(''); // '' | 'dm' | 'gc'
+    const actionState  = Vue.reactive({ busy: false, error: '', success: '' });
+
+    // Conversation drawer state
+    const drawer = Vue.reactive({
+      open: false,
+      session: null,
+      messages: [],
+      loading: false,
+    });
+
+    const agents = Vue.computed(() => {
+      const seen = new Set();
+      const out = [];
+      for (const s of sessions.value) {
+        const key = s.agent_id || s.agent_name || '';
+        if (key && !seen.has(key)) { seen.add(key); out.push({ id: s.agent_id || key, label: s.agent_name || s.agent_id || key }); }
+      }
+      return out;
+    });
+
+    const filtered = Vue.computed(() => {
+      let list = sessions.value;
+      if (filterAgent.value) list = list.filter(s => (s.agent_id || s.agent_name || '') === filterAgent.value);
+      if (filterType.value === 'dm') list = list.filter(s => !s.is_group);
+      if (filterType.value === 'gc') list = list.filter(s => s.is_group);
+      return list;
+    });
+
+    const totalSessions  = Vue.computed(() => sessions.value.length);
+    const activeSessions = Vue.computed(() => sessions.value.filter(s => !s.ended_at).length);
+    const avgMessages    = Vue.computed(() => {
+      if (!sessions.value.length) return 0;
+      const total = sessions.value.reduce((a, s) => a + (s.message_count || 0), 0);
+      return Math.round(total / sessions.value.length);
+    });
+
+    async function load() {
+      try {
+        const params = new URLSearchParams();
+        if (filterAgent.value) params.set('agent_id', filterAgent.value);
+        const r = await fetch('/api/sessions' + (params.toString() ? '?' + params : ''));
+        const data = await r.json();
+        sessions.value = Array.isArray(data) ? data : (data.sessions || []);
+      } catch (e) {
+        console.error('Sessions load error', e);
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    async function openConvDrawer(s) {
+      drawer.open = true;
+      drawer.session = s;
+      drawer.messages = [];
+      drawer.loading = true;
+      try {
+        const r = await fetch(`/api/sessions/${s.id}/messages?limit=100`);
+        const data = await r.json();
+        drawer.messages = data.messages || [];
+        Vue.nextTick(() => {
+          const el = document.getElementById('sess-msg-scroll');
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+      } catch (e) { console.error('Failed to load messages', e); }
+      drawer.loading = false;
+    }
+
+    function closeDrawer() {
+      drawer.open = false;
+      drawer.session = null;
+      drawer.messages = [];
+    }
+
+    async function resumeSession(s) {
+      actionState.busy = true; actionState.error = ''; actionState.success = '';
+      try {
+        const r = await fetch('/api/sessions/resume', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agent_id: s.agent_id, platform_chat_id: s.platform_chat_id, session_id: s.id }),
+        });
+        const data = await r.json();
+        actionState.success = data.reactivated ? 'Session resumed ✓' : 'Session is already active ✓';
+        await load();
+      } catch (e) { actionState.error = e.message; }
+      actionState.busy = false;
+    }
+
+    async function resetSession(s) {
+      actionState.busy = true; actionState.error = ''; actionState.success = '';
+      try {
+        const r = await fetch('/api/sessions/reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agent_id: s.agent_id, platform_chat_id: s.platform_chat_id }),
+        });
+        await r.json();
+        actionState.success = 'Session closed & new session started ✓';
+        closeDrawer();
+        await load();
+      } catch (e) { actionState.error = e.message; }
+      actionState.busy = false;
+    }
+
+    function agentDisplayName(s) {
+      if (s.agent_name) return s.agent_name;
+      const inst = (state.instances || []).find(i => i.id === s.agent_id);
+      return inst ? inst.displayName : (s.agent_id ? s.agent_id.slice(0, 8) + '…' : '—');
+    }
+
+    function accountDisplayName(s) {
+      return s.account_name || (s.platform_chat_id ? String(s.platform_chat_id).slice(0, 12) + (String(s.platform_chat_id).length > 12 ? '…' : '') : '—');
+    }
+
+    function chatTypeLabel(s) {
+      if (s.is_group) return { label: '👥 GC', cls: 'bg-green-900/50 text-green-300 border-green-700' };
+      return { label: '💬 DM', cls: 'bg-gray-800 text-gray-400 border-gray-700' };
+    }
+
+    function drawerTitle(s) {
+      if (!s) return '';
+      const acct = s.account_name || s.platform_chat_id || '?';
+      const agent = agentDisplayName(s);
+      const num = s.session_number || '?';
+      const started = s.started_at ? fmtDate(s.started_at) : '?';
+      return `Session #${num} — ${acct} — ${agent} — ${started}`;
+    }
+
+    Vue.onMounted(() => {
+      load();
+      const timer = setInterval(load, 10000);
+      Vue.onUnmounted(() => clearInterval(timer));
+    });
+
+    return {
+      sessions, filtered, loading, filterAgent, filterType, agents,
+      totalSessions, activeSessions, avgMessages,
+      drawer, actionState,
+      openConvDrawer, closeDrawer, resumeSession, resetSession,
+      agentDisplayName, accountDisplayName, chatTypeLabel, drawerTitle,
+      fmtDate, fmtRel, truncate,
+    };
+  },
+  template: `
+    <div class="p-6">
+      <!-- Header -->
+      <div class="flex items-center justify-between mb-5">
+        <h1 class="text-xl font-bold text-white">Sessions</h1>
+        <span class="text-xs text-gray-500">auto-refresh every 10s · click row to view thread</span>
+      </div>
+
+      <!-- Stats bar -->
+      <div class="grid grid-cols-3 gap-4 mb-6">
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div class="text-3xl font-bold text-white">{{ totalSessions }}</div>
+          <div class="text-xs text-gray-500 mt-1">Total Sessions</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div class="text-3xl font-bold text-green-400">{{ activeSessions }}</div>
+          <div class="text-xs text-gray-500 mt-1">Active Sessions</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4">
+          <div class="text-3xl font-bold text-blue-400">{{ avgMessages }}</div>
+          <div class="text-xs text-gray-500 mt-1">Avg Msgs / Session</div>
+        </div>
+      </div>
+
+      <!-- Filters -->
+      <div class="flex items-center gap-3 mb-4">
+        <select v-model="filterAgent"
+          class="bg-gray-800 border border-gray-700 rounded px-3 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-blue-500">
+          <option value="">All Agents</option>
+          <option v-for="a in agents" :key="a.id" :value="a.id">{{ a.label }}</option>
+        </select>
+        <div class="flex gap-1">
+          <button @click="filterType = ''"
+            :class="filterType === '' ? 'bg-gray-700 text-white' : 'bg-gray-800/50 text-gray-500 hover:text-gray-300'"
+            class="px-3 py-1.5 rounded text-xs transition-colors">All</button>
+          <button @click="filterType = 'dm'"
+            :class="filterType === 'dm' ? 'bg-gray-700 text-white' : 'bg-gray-800/50 text-gray-500 hover:text-gray-300'"
+            class="px-3 py-1.5 rounded text-xs transition-colors">💬 DM</button>
+          <button @click="filterType = 'gc'"
+            :class="filterType === 'gc' ? 'bg-gray-700 text-white' : 'bg-gray-800/50 text-gray-500 hover:text-gray-300'"
+            class="px-3 py-1.5 rounded text-xs transition-colors">👥 GC</button>
+        </div>
+      </div>
+
+      <!-- Table -->
+      <div v-if="loading" class="text-gray-500 py-8 text-center text-sm">Loading sessions…</div>
+      <div v-else class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="text-gray-500 border-b border-gray-800">
+              <th class="text-left py-2 pr-3 font-medium">#</th>
+              <th class="text-left py-2 pr-3 font-medium">Agent</th>
+              <th class="text-left py-2 pr-3 font-medium">Account</th>
+              <th class="text-left py-2 pr-3 font-medium">Type</th>
+              <th class="text-left py-2 pr-3 font-medium">Started</th>
+              <th class="text-left py-2 pr-3 font-medium">Ended</th>
+              <th class="text-left py-2 pr-3 font-medium">Msgs</th>
+              <th class="text-left py-2 pr-3 font-medium">Summary</th>
+              <th class="text-left py-2 font-medium">Status</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in filtered" :key="s.id"
+                class="border-b border-gray-800/50 hover:bg-gray-800/30 cursor-pointer dash-row"
+                @click="openConvDrawer(s)">
+              <td class="py-2 pr-3 text-gray-500 font-mono">{{ s.session_number || '—' }}</td>
+              <td class="py-2 pr-3 text-blue-400">{{ agentDisplayName(s) }}</td>
+              <td class="py-2 pr-3 text-gray-300">{{ accountDisplayName(s) }}</td>
+              <td class="py-2 pr-3">
+                <span :class="chatTypeLabel(s).cls" class="px-2 py-0.5 rounded border text-xs">
+                  {{ chatTypeLabel(s).label }}
+                </span>
+              </td>
+              <td class="py-2 pr-3 text-gray-400 whitespace-nowrap">{{ fmtRel(s.started_at) }}</td>
+              <td class="py-2 pr-3 text-gray-500 whitespace-nowrap">{{ s.ended_at ? fmtRel(s.ended_at) : '—' }}</td>
+              <td class="py-2 pr-3 text-gray-400">{{ s.message_count ?? '—' }}</td>
+              <td class="py-2 pr-3 text-gray-500 max-w-[200px] truncate">{{ s.summary ? truncate(s.summary, 60) : '—' }}</td>
+              <td class="py-2">
+                <span v-if="!s.ended_at"
+                  class="px-2 py-0.5 rounded-full text-xs bg-green-500/20 text-green-400 border border-green-700">
+                  active ✅
+                </span>
+                <span v-else
+                  class="px-2 py-0.5 rounded-full text-xs bg-gray-700/50 text-gray-500 border border-gray-700">
+                  closed
+                </span>
+              </td>
+            </tr>
+            <tr v-if="!filtered.length && !loading">
+              <td colspan="9" class="py-8 text-center text-gray-600">No sessions found</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Conversation Drawer -->
+      <Teleport to="body">
+        <div v-if="drawer.open"
+             class="fixed inset-0 z-50 flex items-stretch justify-end"
+             @click.self="closeDrawer">
+          <!-- Backdrop -->
+          <div class="absolute inset-0 bg-black/60" @click="closeDrawer"></div>
+          <!-- Panel -->
+          <div class="relative z-10 flex flex-col w-full max-w-2xl bg-gray-950 border-l border-gray-800 shadow-2xl">
+            <!-- Drawer header -->
+            <div class="flex items-start justify-between px-5 py-4 border-b border-gray-800 shrink-0">
+              <div>
+                <div class="text-sm font-semibold text-white leading-tight">{{ drawerTitle(drawer.session) }}</div>
+                <div v-if="drawer.session" class="text-xs text-gray-500 mt-0.5">
+                  {{ drawer.session.message_count ?? 0 }} messages · {{ drawer.session.ended_at ? 'closed' : 'active' }}
+                </div>
+              </div>
+              <button @click="closeDrawer" class="text-gray-500 hover:text-white text-lg leading-none ml-4 shrink-0">✕</button>
+            </div>
+            <!-- Messages -->
+            <div id="sess-msg-scroll" class="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+              <div v-if="drawer.loading" class="text-gray-500 text-xs text-center py-8">Loading messages…</div>
+              <div v-else-if="!drawer.messages.length" class="text-gray-600 text-xs text-center py-8">No messages found</div>
+              <template v-else>
+                <div v-for="(m, i) in drawer.messages" :key="m.id || i"
+                     :class="m.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
+                  <div :class="m.role === 'user'
+                         ? 'bg-blue-600/30 text-blue-100 border border-blue-700/50 rounded-2xl rounded-br-sm'
+                         : 'bg-gray-800 text-gray-200 border border-gray-700 rounded-2xl rounded-bl-sm'"
+                       class="max-w-[80%] px-4 py-2.5 text-xs leading-relaxed">
+                    <div class="text-[10px] opacity-50 mb-1">{{ m.role === 'user' ? (m.account_name || 'User') : 'Assistant' }} · {{ fmtRel(m.created_at) }}</div>
+                    <div class="whitespace-pre-wrap break-words">{{ m.content || '' }}</div>
+                  </div>
+                </div>
+              </template>
+            </div>
+            <!-- Drawer action bar -->
+            <div v-if="drawer.session" class="px-5 py-3 border-t border-gray-800 shrink-0 flex items-center gap-2">
+              <div v-if="actionState.success" class="text-xs text-green-400 flex-1">{{ actionState.success }}</div>
+              <div v-else-if="actionState.error" class="text-xs text-red-400 flex-1">{{ actionState.error }}</div>
+              <div v-else class="flex-1"></div>
+              <button @click="resumeSession(drawer.session)" :disabled="actionState.busy || !drawer.session.ended_at"
+                class="px-3 py-1.5 text-xs rounded bg-blue-600/20 text-blue-400 border border-blue-700 hover:bg-blue-600/40 transition-colors disabled:opacity-40">
+                {{ actionState.busy ? '…' : 'Resume' }}
+              </button>
+              <button @click="resetSession(drawer.session)" :disabled="actionState.busy"
+                class="px-3 py-1.5 text-xs rounded bg-red-600/20 text-red-400 border border-red-700 hover:bg-red-600/40 transition-colors disabled:opacity-40">
+                {{ actionState.busy ? '…' : 'Reset' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </Teleport>
+    </div>
+  `,
+};
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 // ─── Reports ──────────────────────────────────────────────────────────────────
 const Reports = {
@@ -3999,7 +4301,8 @@ const routes = [
   { path: '/',              redirect: '/dashboard' },
   { path: '/dashboard',     component: Dashboard },
   { path: '/memories',      component: Memories },
-  { path: '/conversations', component: Conversations },
+  { path: '/conversations', redirect: '/sessions' },
+  { path: '/sessions',      component: Sessions },
   { path: '/handoffs',      component: Handoffs },
   { path: '/tasks',         component: Tasks },
   { path: '/knowledge',     component: Knowledge },

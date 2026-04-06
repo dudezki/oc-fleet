@@ -1891,11 +1891,17 @@ const Skills = {
                     </div>
                     <button @click="toggleAgentAssign(agent)"
                       :disabled="drawer.togglingAgent === agent.id"
-                      :class="drawer.assignedAgentIds.has(agent.id) ? 'bg-blue-600 hover:bg-blue-700 text-white border-blue-500' : 'bg-gray-700 hover:bg-gray-600 text-gray-400 border-gray-600'"
-                      class="flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs transition-colors disabled:opacity-50">
+                      :class="drawer.assignedAgentIds.has(agent.id)
+                        ? 'bg-blue-600 hover:bg-red-600 hover:border-red-500 text-white border-blue-500'
+                        : 'bg-gray-700 hover:bg-blue-600 hover:border-blue-500 hover:text-white text-gray-400 border-gray-600'"
+                      class="flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs transition-all disabled:opacity-50 group">
                       <span v-if="drawer.togglingAgent === agent.id">…</span>
+                      <template v-else-if="drawer.assignedAgentIds.has(agent.id)">
+                        <span class="group-hover:hidden">✓ Assigned</span>
+                        <span class="hidden group-hover:inline">✕ Unassign</span>
+                      </template>
                       <template v-else>
-                        <span>{{ drawer.assignedAgentIds.has(agent.id) ? '✓ Assigned' : '+ Assign' }}</span>
+                        <span>+ Assign</span>
                       </template>
                     </button>
                   </div>

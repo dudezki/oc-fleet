@@ -275,8 +275,9 @@ create_instance "support" 20020 "$GATEWAY_TOKEN_SUPPORT" "$BOT_TOKEN_SUPPORT" "F
 create_instance "manager" 20030 "$GATEWAY_TOKEN_MANAGER" "$BOT_TOKEN_MANAGER" "Fleet-Manager" "claude-sonnet-4-6"
 create_instance "dev"     20040 "$GATEWAY_TOKEN_DEV"     "$BOT_TOKEN_DEV"     "Fleet-Dev"     "claude-sonnet-4-6"
 create_instance "it"      20050 "$GATEWAY_TOKEN_IT"      "$BOT_TOKEN_IT"      "Fleet-IT"      "claude-haiku-4-5"
-create_instance "hr"      20060 "${GATEWAY_TOKEN_HR:-$(openssl rand -hex 32)}" "${BOT_TOKEN_HR:-}" "Fleet-HR"      "claude-sonnet-4-6"
-create_instance "finance" 20070 "${GATEWAY_TOKEN_FINANCE:-$(openssl rand -hex 32)}" "${BOT_TOKEN_FINANCE:-}" "Fleet-Finance" "claude-sonnet-4-6"
+create_instance "hr"         20060 "${GATEWAY_TOKEN_HR:-$(openssl rand -hex 32)}"         "${BOT_TOKEN_HR:-}"         "Fleet-HR"         "claude-sonnet-4-6"
+create_instance "finance"    20070 "${GATEWAY_TOKEN_FINANCE:-$(openssl rand -hex 32)}"    "${BOT_TOKEN_FINANCE:-}"    "Fleet-Finance"    "claude-sonnet-4-6"
+create_instance "documentor" 20090 "${GATEWAY_TOKEN_DOCUMENTOR:-$(openssl rand -hex 32)}" "${BOT_TOKEN_DOCUMENTOR:-}" "Fleet-Documentor" "google/gemini-3.1-pro-preview"
 
 # ── fleet.sh ─────────────────────────────────────────────────────────────────
 info "Writing fleet.sh..."

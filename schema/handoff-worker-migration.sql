@@ -29,3 +29,9 @@ ALTER TABLE fleet.agents
 -- These will be overridden by the worker's .env or DB lookup
 COMMENT ON COLUMN fleet.agents.gateway_port  IS 'OpenClaw gateway port for this agent instance';
 COMMENT ON COLUMN fleet.agents.gateway_token IS 'OpenClaw gateway auth token for system event injection';
+
+-- Unify gateway_token + hooks_token (2026-04-06)
+-- hooks_token is the single token used for both OC gateway auth AND handoff worker delivery
+ALTER TABLE fleet.agents ADD COLUMN IF NOT EXISTS hooks_token TEXT;
+UPDATE fleet.agents SET hooks_token = gateway_token WHERE hooks_token IS NULL AND gateway_token IS NOT NULL;
+COMMENT ON COLUMN fleet.agents.hooks_token IS 'Unified auth token — used for OpenClaw gateway auth AND handoff worker delivery. Always equals gateway_token.';

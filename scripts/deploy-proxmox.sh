@@ -198,7 +198,7 @@ fi
 create_instance() {
   local name="$1"
   local port="$2"
-  local gateway_token="$3"
+  local hooks_token="$3"   # unified token — used for both OpenClaw gateway auth AND handoff worker
   local bot_token="$4"
   local agent_name="$5"
   local model="${6:-claude-sonnet-4-6}"
@@ -218,7 +218,7 @@ create_instance() {
     "bind": "loopback",
     "auth": {
       "mode": "token",
-      "token": "$gateway_token"
+      "token": "$hooks_token"
     }
   },
   "auth": {
@@ -299,7 +299,25 @@ EOF
     cp "$soul_src" "$oc_dir/workspace/SOUL.md"
   fi
 
-  success "  $agent_name → port $port"
+  # Write auth-profiles to agent dir too (OpenClaw looks here at runtime)
+  mkdir -p "$oc_dir/agents/main/agent"
+  cp "$oc_dir/identity/auth-profiles.json" "$oc_dir/agents/main/agent/auth-profiles.json"
+
+  # Upsert agent into DB with hooks_token + gateway_token unified
+  PGPASSWORD="${PG_PASS}" psql -h 127.0.0.1 -p "${PG_PORT}" -U "${PG_USER}" -d "${PG_DB}" <<SQL 2>/dev/null || true
+    INSERT INTO fleet.agents (org_id, name, slug, status, config, bot_token, gateway_port, gateway_token, hooks_token)
+    VALUES (
+      '${ORG_ID}', '${agent_name}', '${name}', 'active',
+      '{"meta": {"emoji": "🤖", "model": "${model}", "provider": "anthropic", "port": ${port}}}'::jsonb,
+      '${bot_token}', ${port}, '${hooks_token}', '${hooks_token}'
+    )
+    ON CONFLICT DO NOTHING;
+    UPDATE fleet.agents
+    SET gateway_token='${hooks_token}', hooks_token='${hooks_token}', gateway_port=${port}, bot_token='${bot_token}'
+    WHERE slug='${name}' AND org_id='${ORG_ID}';
+SQL
+
+  success "  $agent_name → port $port (hooks_token set)"
 }
 
 create_instance "sales"   20010 "$GATEWAY_TOKEN_SALES"   "$BOT_TOKEN_SALES"   "Fleet-Sales"   "claude-sonnet-4-6"

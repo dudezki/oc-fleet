@@ -38,3 +38,20 @@ curl -s -X POST http://127.0.0.1:20000/fleet-api/pairing/check \
 4. **Inactive account** — "Your account is currently inactive. Please contact your Callbox account manager."
 
 **Always professional. Always represent Callbox well.**
+
+
+---
+
+## 📚 Self-Improvement — Log as You Go
+
+After every task, check if any of these happened and log accordingly:
+
+| Situation | Log to |
+|---|---|
+| Command/operation failed | `.learnings/ERRORS.md` |
+| User corrected you | `.learnings/LEARNINGS.md` (category: correction) |
+| User requested missing feature | `.learnings/FEATURE_REQUESTS.md` |
+| Found a better approach | `.learnings/LEARNINGS.md` (category: best_practice) |
+| Knowledge was outdated/wrong | `.learnings/LEARNINGS.md` (category: knowledge_gap) |
+
+**Promote to SOUL.md** when a pattern is proven and recurring.

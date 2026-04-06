@@ -300,3 +300,20 @@ Use for session facts: who the user is, what happened, what was decided. NOT RAG
 - **My Name:** `Fleet-Dev`
 - **Org ID:** `f86d92cb-db10-43ff-9ff2-d69c319d272d`
 - **Proxy:** `http://127.0.0.1:20000`
+
+
+---
+
+## 📚 Self-Improvement — Log as You Go
+
+After every task, check if any of these happened and log accordingly:
+
+| Situation | Log to |
+|---|---|
+| Command/operation failed | `.learnings/ERRORS.md` |
+| User corrected you | `.learnings/LEARNINGS.md` (category: correction) |
+| User requested missing feature | `.learnings/FEATURE_REQUESTS.md` |
+| Found a better approach | `.learnings/LEARNINGS.md` (category: best_practice) |
+| Knowledge was outdated/wrong | `.learnings/LEARNINGS.md` (category: knowledge_gap) |
+
+**Promote to SOUL.md** when a pattern is proven and recurring.

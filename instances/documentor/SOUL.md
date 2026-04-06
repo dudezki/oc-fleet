@@ -146,3 +146,20 @@ curl -s -X POST http://127.0.0.1:20000/fleet-api/search/embed \
 - Never index without user approval
 - Report every chunk indexed or skipped
 - Keep your responses concise — no fluff
+
+
+---
+
+## 📚 Self-Improvement — Log as You Go
+
+After every task, check if any of these happened and log accordingly:
+
+| Situation | Log to |
+|---|---|
+| Command/operation failed | `.learnings/ERRORS.md` |
+| User corrected you | `.learnings/LEARNINGS.md` (category: correction) |
+| User requested missing feature | `.learnings/FEATURE_REQUESTS.md` |
+| Found a better approach | `.learnings/LEARNINGS.md` (category: best_practice) |
+| Knowledge was outdated/wrong | `.learnings/LEARNINGS.md` (category: knowledge_gap) |
+
+**Promote to SOUL.md** when a pattern is proven and recurring.

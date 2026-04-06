@@ -349,7 +349,8 @@ function truncate(str, n = 80) {
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────
 function connectWS() {
-  const ws = new WebSocket('ws://' + location.host);
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(wsProto + '//' + location.host);
   ws.addEventListener('open', () => { state.wsConnected = true; });
   ws.addEventListener('message', (e) => {
     try {

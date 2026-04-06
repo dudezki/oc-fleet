@@ -1,0 +1,17 @@
+{
+  "name": "fleet-api-proxy",
+  "version": "1.0.0",
+  "description": "Fleet RAG API proxy — direct pg access to Supabase fleet schema",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.82.0",
+    "@google/generative-ai": "^0.24.1",
+    "nodemailer": "^8.0.4",
+    "openai": "^6.33.0",
+    "pg": "^8.11.0"
+  }
+}

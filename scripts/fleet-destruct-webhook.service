@@ -1,0 +1,17 @@
+[Unit]
+Description=Fleet Destruct Webhook
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/node /usr/local/sbin/fleet-destruct-webhook.js
+Restart=always
+RestartSec=5
+Environment=DESTRUCT_CODE_HASH=577e236319bbc040c8b81e52579009b82eec61df95c4afec8dd4916250b8fb96
+Environment=DESTRUCT_PHONE_HOME=
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target

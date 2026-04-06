@@ -472,6 +472,29 @@ http.createServer(async (req, res) => {
           })();
         }
 
+      // ── Session: reset via direct proxy call (bypasses agent) ──────────────
+      } else if (fn === 'session/reset-by-telegram') {
+        // p: { org_id, agent_id, telegram_id, chat_type? }
+        // Close active session + open new one
+        const activeR = await pg.query(
+          `SELECT id, session_number FROM fleet.sessions WHERE agent_id=$1 AND platform_chat_id=$2 AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1`,
+          [p.agent_id, p.telegram_id]
+        );
+        let old_session = null;
+        if (activeR.rows.length > 0) {
+          await pg.query(
+            `UPDATE fleet.sessions SET ended_at=now(), reset_by='user', updated_at=now() WHERE id=$1`,
+            [activeR.rows[0].id]
+          );
+          old_session = { id: activeR.rows[0].id, session_number: activeR.rows[0].session_number };
+        }
+        const newR = await pg.query(
+          `INSERT INTO fleet.sessions (org_id, agent_id, platform_chat_id, chat_type) VALUES ($1,$2,$3,$4) RETURNING id, session_number`,
+          [p.org_id, p.agent_id, p.telegram_id, p.chat_type || 'direct']
+        );
+        result = { old_session, new_session: { id: newR.rows[0].id, session_number: newR.rows[0].session_number } };
+        console.log(`[proxy] session/reset-by-telegram: ${p.telegram_id} -> new session #${newR.rows[0].session_number}`);
+
       // ── Pairing: verify email and bind telegram user ──────────────────────
       // ── OTP ───────────────────────────────────────────────────────────
       } else if (fn === 'pairing/otp/send') {

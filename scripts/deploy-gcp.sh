@@ -422,6 +422,27 @@ success "Cron jobs installed:"
 info "  sync-sessions  → every 2 min"
 info "  handoff-worker → every 1 min"
 
+# ── Seed bot tokens + gateway config into DB ─────────────────────────────────
+info "Seeding agent config into DB..."
+declare -A AGENT_BOTS=(
+  [sales]="$BOT_TOKEN_SALES:$GATEWAY_TOKEN_SALES:20010"
+  [support]="$BOT_TOKEN_SUPPORT:$GATEWAY_TOKEN_SUPPORT:20020"
+  [manager]="$BOT_TOKEN_MANAGER:$GATEWAY_TOKEN_MANAGER:20030"
+  [dev]="$BOT_TOKEN_DEV:$GATEWAY_TOKEN_DEV:20040"
+  [it]="$BOT_TOKEN_IT:$GATEWAY_TOKEN_IT:20050"
+  [hr]="${BOT_TOKEN_HR:-}:${GATEWAY_TOKEN_HR:-}:20060"
+  [finance]="${BOT_TOKEN_FINANCE:-}:${GATEWAY_TOKEN_FINANCE:-}:20070"
+  [documentor]="${BOT_TOKEN_DOCUMENTOR:-}::20090"
+)
+for slug in "${!AGENT_BOTS[@]}"; do
+  IFS=':' read -r bot_token gw_token port <<< "${AGENT_BOTS[$slug]}"
+  hooks_token=$(python3 -c "import json,os;h=os.path.expanduser('~/cbfleet-rag-$slug/.openclaw/openclaw.json');d=json.load(open(h)) if os.path.exists(h) else {};print(d.get('hooks',{}).get('token',''))" 2>/dev/null)
+  [ -z "$bot_token" ] && continue
+  PGPASSWORD="$PG_PASS" psql -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER_VAR" -d "$PG_DB" -c \
+    "UPDATE fleet.agents SET bot_token='$bot_token', gateway_port=$port, hooks_token='$hooks_token' WHERE slug='$slug';" -q 2>/dev/null
+  success "  $slug: bot_token seeded"
+done
+
 # ── Start everything ──────────────────────────────────────────────────────────
 info "Starting fleet..."
 bash "$FLEET_SCRIPT" start all

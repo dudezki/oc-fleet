@@ -850,6 +850,80 @@ http.createServer(async (req, res) => {
           result = { skills: r.rows };
         }
 
+      } else if (fn === 'skills/match') {
+        // On-demand RAG skill match
+        // Params: query (string), agent (slug, optional)
+        const { query: smQuery, agent: smAgent } = p;
+        if (!smQuery) {
+          result = { match: null, reason: 'no query provided' };
+        } else {
+          const geminiKey = GEMINI_KEY;
+          if (!geminiKey) {
+            result = { match: null, reason: 'no gemini key' };
+          } else {
+            const smEmbedResp = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${geminiKey}`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: 'models/gemini-embedding-001', content: { parts: [{ text: smQuery }] } })
+              }
+            );
+            const smEmbedData = await smEmbedResp.json();
+            const smQueryVec = smEmbedData?.embedding?.values;
+            if (!smQueryVec) {
+              result = { match: null, reason: 'embedding failed' };
+            } else {
+              const smVecStr = `[${smQueryVec.join(',')}]`;
+              let smMatchRow;
+              if (smAgent) {
+                const smR = await pg.query(
+                  `SELECT s.slug, s.name, s.description, s.api_endpoint, s.api_method, s.instructions,
+                          1 - (s.description_embedding <=> $1::vector) AS confidence
+                   FROM fleet.skills s
+                   JOIN fleet.agent_skill_assignments asa ON asa.skill_id = s.id
+                   JOIN fleet.agents ag ON ag.id = asa.agent_id
+                   WHERE ag.slug = $2
+                     AND s.is_active = true
+                     AND asa.enabled = true
+                     AND s.description_embedding IS NOT NULL
+                   ORDER BY confidence DESC
+                   LIMIT 1`,
+                  [smVecStr, smAgent]
+                );
+                smMatchRow = smR.rows[0];
+              } else {
+                const smR = await pg.query(
+                  `SELECT slug, name, description, api_endpoint, api_method, instructions,
+                          1 - (description_embedding <=> $1::vector) AS confidence
+                   FROM fleet.skills
+                   WHERE is_active = true AND description_embedding IS NOT NULL
+                   ORDER BY confidence DESC
+                   LIMIT 1`,
+                  [smVecStr]
+                );
+                smMatchRow = smR.rows[0];
+              }
+              const SM_THRESHOLD = 0.65;
+              if (!smMatchRow || parseFloat(smMatchRow.confidence) < SM_THRESHOLD) {
+                result = { match: null, confidence: smMatchRow ? parseFloat(parseFloat(smMatchRow.confidence).toFixed(4)) : 0, reason: 'no confident match' };
+              } else {
+                result = {
+                  match: {
+                    slug: smMatchRow.slug,
+                    name: smMatchRow.name,
+                    description: smMatchRow.description,
+                    api_endpoint: smMatchRow.api_endpoint,
+                    api_method: smMatchRow.api_method,
+                    instructions: smMatchRow.instructions,
+                    confidence: parseFloat(parseFloat(smMatchRow.confidence).toFixed(4))
+                  }
+                };
+              }
+            }
+          }
+        }
+
       } else if (fn === 'skills/override') {
         // p: { org_id, account_id, skill_slug, override_type (grant|revoke), reason?, granted_by_telegram_id? }
         const skillR = await pg.query(`SELECT id FROM fleet.skills WHERE slug = $1`, [p.skill_slug]);

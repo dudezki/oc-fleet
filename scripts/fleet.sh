@@ -29,6 +29,11 @@ AEGIS_HOME=/home/dev-user/aegis
 GOOGLE_AUTH_PORT=19001
 GOOGLE_AUTH_JS=/home/dev-user/Projects/oc-fleet/google-auth-proxy/server.js
 
+HUBSPOT_OAUTH_PORT=19002
+HUBSPOT_OAUTH_JS=/home/dev-user/Projects/oc-fleet/hubspot-oauth/server.js
+HUBSPOT_PROXY_PORT=19003
+HUBSPOT_PROXY_JS=/home/dev-user/Projects/oc-fleet/hubspot-proxy/server.js
+
 start_dashboard() {
   kill $(lsof -ti :$DASHBOARD_PORT) 2>/dev/null; sleep 0.5
   node "$DASHBOARD_JS" > /tmp/fleet-dashboard.log 2>&1 &
@@ -78,6 +83,44 @@ stop_google_auth() {
   [ -f /tmp/fleet-google-auth.pid ] && kill "$(cat /tmp/fleet-google-auth.pid)" 2>/dev/null && rm -f /tmp/fleet-google-auth.pid
   lsof -ti :$GOOGLE_AUTH_PORT | xargs kill -9 2>/dev/null
   echo "⏹  Stopped google-auth"
+}
+
+start_hubspot_oauth() {
+  lsof -ti :$HUBSPOT_OAUTH_PORT | xargs kill -9 2>/dev/null; sleep 0.5
+  HUBSPOT_CLIENT_ID="${HUBSPOT_CLIENT_ID}" \
+  HUBSPOT_CLIENT_SECRET="${HUBSPOT_CLIENT_SECRET}" \
+  HUBSPOT_REDIRECT_URI="${HUBSPOT_REDIRECT_URI}" \
+  TOKEN_STORE_DIR="${TOKEN_STORE_DIR:-$HOME/.callbox-hubspot-tokens}" \
+  node "$HUBSPOT_OAUTH_JS" > /tmp/fleet-hubspot-oauth.log 2>&1 &
+  echo $! > /tmp/fleet-hubspot-oauth.pid
+  sleep 2
+  local r; r=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$HUBSPOT_OAUTH_PORT/health 2>/dev/null)
+  [ "$r" = "200" ] && echo "  ✅ hubspot-oauth up (:$HUBSPOT_OAUTH_PORT)" || echo "  ❌ hubspot-oauth failed — check /tmp/fleet-hubspot-oauth.log"
+}
+
+stop_hubspot_oauth() {
+  [ -f /tmp/fleet-hubspot-oauth.pid ] && kill "$(cat /tmp/fleet-hubspot-oauth.pid)" 2>/dev/null && rm -f /tmp/fleet-hubspot-oauth.pid
+  lsof -ti :$HUBSPOT_OAUTH_PORT | xargs kill -9 2>/dev/null
+  echo "⏹  Stopped hubspot-oauth"
+}
+
+start_hubspot_proxy() {
+  lsof -ti :$HUBSPOT_PROXY_PORT | xargs kill -9 2>/dev/null; sleep 0.5
+  HUBSPOT_ADMIN_TOKEN_MARKETING_CRM="${HUBSPOT_ADMIN_TOKEN_MARKETING_CRM}" \
+  HUBSPOT_ADMIN_TOKEN_ONE_CRM="${HUBSPOT_ADMIN_TOKEN_ONE_CRM}" \
+  ROUTING_TABLE_PATH="${ROUTING_TABLE_PATH}" \
+  PROXY_DIR="/home/dev-user/Projects/oc-fleet/hubspot-proxy" \
+  node "$HUBSPOT_PROXY_JS" > /tmp/fleet-hubspot-proxy.log 2>&1 &
+  echo $! > /tmp/fleet-hubspot-proxy.pid
+  sleep 2
+  local r; r=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$HUBSPOT_PROXY_PORT/health 2>/dev/null)
+  [ "$r" = "200" ] && echo "  ✅ hubspot-proxy up (:$HUBSPOT_PROXY_PORT)" || echo "  ❌ hubspot-proxy failed — check /tmp/fleet-hubspot-proxy.log"
+}
+
+stop_hubspot_proxy() {
+  [ -f /tmp/fleet-hubspot-proxy.pid ] && kill "$(cat /tmp/fleet-hubspot-proxy.pid)" 2>/dev/null && rm -f /tmp/fleet-hubspot-proxy.pid
+  lsof -ti :$HUBSPOT_PROXY_PORT | xargs kill -9 2>/dev/null
+  echo "⏹  Stopped hubspot-proxy"
 }
 
 start_aegis() {
@@ -167,24 +210,32 @@ status_all() {
   local rg
   rg=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$GOOGLE_AUTH_PORT/health 2>/dev/null)
   [ "$rg" = "200" ] && echo "  ✅ google-auth :$GOOGLE_AUTH_PORT" || echo "  ❌ google-auth :$GOOGLE_AUTH_PORT  (down)"
+  local rho
+  rho=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$HUBSPOT_OAUTH_PORT/health 2>/dev/null)
+  [ "$rho" = "200" ] && echo "  ✅ hubspot-oauth :$HUBSPOT_OAUTH_PORT" || echo "  ❌ hubspot-oauth :$HUBSPOT_OAUTH_PORT  (down)"
+  local rhp
+  rhp=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$HUBSPOT_PROXY_PORT/health 2>/dev/null)
+  [ "$rhp" = "200" ] && echo "  ✅ hubspot-proxy :$HUBSPOT_PROXY_PORT" || echo "  ❌ hubspot-proxy :$HUBSPOT_PROXY_PORT  (down)"
 }
 
 case "$cmd" in
   start)
-    [ "$target" = "all" ] && { start_proxy; start_dashboard; start_google_auth; start_aegis; start_handoff_worker; }
+    [ "$target" = "all" ] && { start_proxy; start_dashboard; start_google_auth; start_hubspot_oauth; start_hubspot_proxy; start_aegis; start_handoff_worker; }
     for inst in $(instances); do start_instance "$inst"; done ;;
   stop)
     for inst in $(instances); do stop_instance "$inst"; done
-    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_aegis; stop_handoff_worker; } ;;
+    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_hubspot_oauth; stop_hubspot_proxy; stop_aegis; stop_handoff_worker; } ;;
   restart)
     for inst in $(instances); do stop_instance "$inst"; done
-    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_aegis; stop_handoff_worker; sleep 1; start_proxy; start_dashboard; start_google_auth; start_aegis; start_handoff_worker; }
+    [ "$target" = "all" ] && { stop_proxy; stop_dashboard; stop_google_auth; stop_hubspot_oauth; stop_hubspot_proxy; stop_aegis; stop_handoff_worker; sleep 1; start_proxy; start_dashboard; start_google_auth; start_hubspot_oauth; start_hubspot_proxy; start_aegis; start_handoff_worker; }
     sleep 1
     for inst in $(instances); do start_instance "$inst"; done ;;
-  proxy)       stop_proxy; start_proxy ;;
-  dashboard)   stop_dashboard; start_dashboard ;;
-  aegis)       stop_aegis; start_aegis ;;
-  google-auth) stop_google_auth; start_google_auth ;;
+  proxy)          stop_proxy; start_proxy ;;
+  dashboard)      stop_dashboard; start_dashboard ;;
+  aegis)          stop_aegis; start_aegis ;;
+  google-auth)    stop_google_auth; start_google_auth ;;
+  hubspot-oauth)  stop_hubspot_oauth; start_hubspot_oauth ;;
+  hubspot-proxy)  stop_hubspot_proxy; start_hubspot_proxy ;;
   status)      status_all ;;
   *)
     echo "Usage: fleet.sh [start|stop|restart|proxy|dashboard|status] [sales|support|manager|all]" ;;

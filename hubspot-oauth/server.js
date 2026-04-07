@@ -25,6 +25,7 @@ const HS_AUTH_URL  = 'https://app.hubspot.com/oauth/authorize';
 const HS_TOKEN_URL = 'https://api.hubapi.com/oauth/v1/token';
 
 const TOKEN_DIR = process.env.TOKEN_STORE_DIR || '/home/dev-user/.callbox-hubspot-tokens';
+const ORG_ID    = 'f86d92cb-db10-43ff-9ff2-d69c319d272d';
 
 // Known portals
 const KNOWN_PORTALS = {
@@ -51,53 +52,99 @@ const ROLE_SCOPE_ADDITIONS    = { 'org': [], 'team': [], 'owner': [] };
 function getClientId()     { return process.env.HUBSPOT_CLIENT_ID; }
 function getClientSecret() { return process.env.HUBSPOT_CLIENT_SECRET; }
 
-// ─── File-based token storage (replaces macOS Keychain) ───────────────────────
+// ─── Token storage — DB-first, file fallback ──────────────────────────────────
+
+const { Pool } = require('pg');
+const dbPool = new Pool({ connectionString: process.env.DATABASE_URL || 'postgresql://postgres:fleetdev@127.0.0.1:5433/fleet_dev' });
 
 function keychainTokenKey(email, hubId) {
   return path.join(TOKEN_DIR, `${email}-${hubId}.token`);
 }
 
-function saveRefreshToken(email, hubId, refreshToken) {
+async function saveRefreshToken(email, hubId, refreshToken, extra = {}) {
   try {
-    fs.mkdirSync(TOKEN_DIR, { recursive: true });
-    fs.writeFileSync(
-      keychainTokenKey(email, hubId),
-      JSON.stringify({ token: refreshToken, issued_at: Date.now(), hub_id: hubId })
+    const acct = await dbPool.query(
+      `SELECT id FROM fleet.accounts WHERE email=$1 AND org_id=$2`, [email, ORG_ID]
     );
-    console.log(`[hubspot-oauth] Refresh token saved for ${email} (portal: ${hubId})`);
+    if (!acct.rows.length) throw new Error(`Account not found: ${email}`);
+    const account_id = acct.rows[0].id;
+    const scopes = extra.scopes || [];
+    const credentials = JSON.stringify({ refresh_token: refreshToken, issued_at: Date.now(), hub_id: hubId });
+    const meta = JSON.stringify({ hub_id: hubId, portal_name: KNOWN_PORTALS[hubId] || `Portal ${hubId}`, owner_id: extra.owner_id || null, user_id: extra.user_id || null, email });
+    await dbPool.query(`
+      INSERT INTO fleet.user_integrations (org_id, account_id, integration, portal_id, enabled, scopes, credentials, meta)
+      VALUES ($1,$2,'hubspot',$3,true,$4,$5,$6)
+      ON CONFLICT (org_id, account_id, integration, portal_id) DO UPDATE SET
+        credentials=EXCLUDED.credentials,
+        scopes=CASE WHEN array_length(EXCLUDED.scopes,1)>0 THEN EXCLUDED.scopes ELSE fleet.user_integrations.scopes END,
+        meta=EXCLUDED.meta, enabled=true, updated_at=now()
+    `, [ORG_ID, account_id, String(hubId), scopes, credentials, meta]);
+    console.log(`[hubspot-oauth] Refresh token saved to DB for ${email} (portal: ${hubId})`);
   } catch (err) {
-    console.error(`[hubspot-oauth] Failed to save refresh token for ${email}:${hubId}:`, err.message);
+    console.error(`[hubspot-oauth] DB save failed, falling back to file: ${err.message}`);
+    try { fs.mkdirSync(TOKEN_DIR, { recursive: true }); fs.writeFileSync(keychainTokenKey(email, hubId), JSON.stringify({ token: refreshToken, issued_at: Date.now(), hub_id: hubId })); } catch {}
   }
 }
 
-function loadRefreshToken(email, hubId) {
+async function loadRefreshToken(email, hubId) {
+  try {
+    const result = await dbPool.query(
+      `SELECT ui.credentials, ui.created_at FROM fleet.user_integrations ui
+       JOIN fleet.accounts a ON a.id=ui.account_id
+       WHERE a.email=$1 AND ui.integration='hubspot' AND ui.portal_id=$2 AND ui.enabled=true AND ui.org_id=$3`,
+      [email, String(hubId), ORG_ID]
+    );
+    if (result.rows.length) {
+      const creds = result.rows[0].credentials;
+      const token = creds.refresh_token || creds.token || null;
+      const issued_at = creds.issued_at || Date.parse(result.rows[0].created_at);
+      const age = Date.now() - issued_at;
+      if (age > REFRESH_TOKEN_MAX_AGE_MS) return null;
+      return { token, issued_at, age_days: Math.floor(age / 86400000) };
+    }
+  } catch (err) { console.error(`[hubspot-oauth] DB load failed: ${err.message}`); }
+  // File fallback + auto-migrate
   try {
     const raw = JSON.parse(fs.readFileSync(keychainTokenKey(email, hubId), 'utf8'));
     const age = Date.now() - raw.issued_at;
-    if (age > REFRESH_TOKEN_MAX_AGE_MS) {
-      console.log(`[hubspot-oauth] Refresh token for ${email}:${hubId} is ${Math.floor(age / 86400000)}d old — expired`);
-      return null;
-    }
+    if (age > REFRESH_TOKEN_MAX_AGE_MS) return null;
+    await saveRefreshToken(email, hubId, raw.token);
+    try { fs.unlinkSync(keychainTokenKey(email, hubId)); } catch {}
     return { token: raw.token, issued_at: raw.issued_at, age_days: Math.floor(age / 86400000) };
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-function loadRefreshTokenLegacy(email) {
+async function loadRefreshTokenLegacy(email) {
   try {
-    const legacyPath = path.join(TOKEN_DIR, `${email}.token`);
-    const raw = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+    const result = await dbPool.query(
+      `SELECT ui.credentials FROM fleet.user_integrations ui
+       JOIN fleet.accounts a ON a.id=ui.account_id
+       WHERE a.email=$1 AND ui.integration='hubspot' AND ui.enabled=true AND ui.org_id=$2
+       ORDER BY ui.updated_at DESC LIMIT 1`,
+      [email, ORG_ID]
+    );
+    if (result.rows.length) {
+      const creds = result.rows[0].credentials;
+      return { token: creds.refresh_token || creds.token, issued_at: creds.issued_at, age_days: null };
+    }
+  } catch {}
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(TOKEN_DIR, `${email}.token`), 'utf8'));
     if (raw.token) return { token: raw.token, issued_at: raw.issued_at, age_days: null };
   } catch {}
   return null;
 }
 
-function deleteRefreshToken(email, hubId) {
+async function deleteRefreshToken(email, hubId) {
   try {
-    fs.unlinkSync(keychainTokenKey(email, hubId));
-    console.log(`[hubspot-oauth] Refresh token removed for ${email} (portal: ${hubId})`);
-  } catch {}
+    await dbPool.query(
+      `UPDATE fleet.user_integrations ui SET enabled=false, updated_at=now()
+       FROM fleet.accounts a WHERE a.id=ui.account_id AND a.email=$1 AND ui.integration='hubspot' AND ui.portal_id=$2 AND ui.org_id=$3`,
+      [email, String(hubId), ORG_ID]
+    );
+    console.log(`[hubspot-oauth] Token disabled in DB for ${email} (portal: ${hubId})`);
+  } catch (err) { console.error(`[hubspot-oauth] DB delete failed: ${err.message}`); }
+  try { fs.unlinkSync(keychainTokenKey(email, hubId)); } catch {}
 }
 
 // ─── Session key helpers ──────────────────────────────────────────────────────

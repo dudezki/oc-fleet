@@ -52,22 +52,86 @@ async function loadRedirectUriFromDb() {
   }
 }
 
-// ─── Token file storage (Linux-safe, replaces Keychain) ──────────────────────
+// ─── Token storage — DB-first, file fallback ────────────────────────────────
 
-function saveRefreshToken(email, token) {
-  fs.mkdirSync(TOKEN_DIR, { recursive: true });
-  fs.writeFileSync(path.join(TOKEN_DIR, `${email}.token`), token, 'utf8');
-  console.log(`[google-auth] Refresh token saved for ${email}`);
+const ORG_ID = 'f86d92cb-db10-43ff-9ff2-d69c319d272d';
+
+async function saveRefreshToken(email, token, scopes = [], meta = {}) {
+  try {
+    await withPg(async (pg) => {
+      const acct = await pg.query(
+        `SELECT id FROM fleet.accounts WHERE email=$1 AND org_id=$2`,
+        [email, ORG_ID]
+      );
+      if (!acct.rows.length) throw new Error(`Account not found for ${email}`);
+      const account_id = acct.rows[0].id;
+      await pg.query(`
+        INSERT INTO fleet.user_integrations
+          (org_id, account_id, integration, portal_id, enabled, scopes, credentials, meta)
+        VALUES ($1,$2,'google',NULL,true,$3,$4,$5)
+        ON CONFLICT (org_id, account_id, integration, portal_id) DO UPDATE SET
+          credentials = EXCLUDED.credentials,
+          scopes      = CASE WHEN array_length(EXCLUDED.scopes,1) > 0 THEN EXCLUDED.scopes ELSE fleet.user_integrations.scopes END,
+          meta        = CASE WHEN EXCLUDED.meta != '{}'::jsonb THEN EXCLUDED.meta ELSE fleet.user_integrations.meta END,
+          updated_at  = now()
+      `, [ORG_ID, account_id, scopes, JSON.stringify({ refresh_token: token, issued_at: Date.now() }), JSON.stringify({ email, ...meta })]);
+    });
+    console.log(`[google-auth] Refresh token saved to DB for ${email}`);
+  } catch (err) {
+    console.error(`[google-auth] DB save failed, falling back to file: ${err.message}`);
+    fs.mkdirSync(TOKEN_DIR, { recursive: true });
+    fs.writeFileSync(path.join(TOKEN_DIR, `${email}.token`), token, 'utf8');
+  }
 }
 
-function loadRefreshToken(email) {
-  try { return fs.readFileSync(path.join(TOKEN_DIR, `${email}.token`), 'utf8').trim(); }
-  catch { return null; }
+async function loadRefreshToken(email) {
+  try {
+    const result = await withPg(async (pg) => {
+      return pg.query(
+        `SELECT ui.credentials FROM fleet.user_integrations ui
+         JOIN fleet.accounts a ON a.id = ui.account_id
+         WHERE a.email=$1 AND ui.integration='google' AND ui.enabled=true AND ui.org_id=$2`,
+        [email, ORG_ID]
+      );
+    });
+    if (result.rows.length) {
+      const creds = result.rows[0].credentials;
+      const token = creds.refresh_token || creds.token || null;
+      if (token) {
+        // Auto-migrate file token if DB found it
+        return token;
+      }
+    }
+  } catch (err) {
+    console.error(`[google-auth] DB load failed, falling back to file: ${err.message}`);
+  }
+  // File fallback — migrate to DB on next save
+  try {
+    const token = fs.readFileSync(path.join(TOKEN_DIR, `${email}.token`), 'utf8').trim();
+    if (token) {
+      console.log(`[google-auth] Migrating file token to DB for ${email}`);
+      await saveRefreshToken(email, token);
+      fs.unlinkSync(path.join(TOKEN_DIR, `${email}.token`));
+    }
+    return token || null;
+  } catch { return null; }
 }
 
-function deleteRefreshToken(email) {
-  try { fs.unlinkSync(path.join(TOKEN_DIR, `${email}.token`)); }
-  catch {}
+async function deleteRefreshToken(email) {
+  try {
+    await withPg(async (pg) => {
+      await pg.query(
+        `UPDATE fleet.user_integrations ui SET enabled=false, updated_at=now()
+         FROM fleet.accounts a
+         WHERE a.id=ui.account_id AND a.email=$1 AND ui.integration='google' AND ui.org_id=$2`,
+        [email, ORG_ID]
+      );
+    });
+    console.log(`[google-auth] Token disabled in DB for ${email}`);
+  } catch (err) {
+    console.error(`[google-auth] DB delete failed: ${err.message}`);
+  }
+  try { fs.unlinkSync(path.join(TOKEN_DIR, `${email}.token`)); } catch {}
 }
 
 // ─── In-memory session store ──────────────────────────────────────────────────

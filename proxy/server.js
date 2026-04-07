@@ -171,26 +171,27 @@ const PORT = process.env.PORT || 20000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const GEMINI_KEY = process.env.GEMINI_API_KEY || OPENAI_KEY;
-const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const RESEND_FROM = process.env.RESEND_FROM || 'Callbox Fleet <noreply@callboxinc.com>';
+const nodemailer = require('nodemailer');
+const SMTP_FROM = process.env.SMTP_FROM || 'Callbox Fleet <oc@callboxinc.com>';
+const smtpTransport = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'callboxinc.com',
+  port: parseInt(process.env.SMTP_PORT || '465'),
+  secure: process.env.SMTP_SECURE !== 'false',
+  auth: {
+    user: process.env.SMTP_USER || 'oc@callboxinc.com',
+    pass: process.env.SMTP_PASS || ''
+  }
+});
 
 async function sendOTPEmail(to, otp, name) {
-  if (!RESEND_API_KEY) throw new Error('RESEND_API_KEY not set');
-  const body = JSON.stringify({
-    from: RESEND_FROM,
-    to: [to],
+  if (!process.env.SMTP_USER) throw new Error('SMTP_USER not set');
+  const info = await smtpTransport.sendMail({
+    from: SMTP_FROM,
+    to,
     subject: 'Your Callbox Fleet Verification Code',
     html: `<p>Hi ${name || 'there'},</p><p>Your verification code for <strong>Callbox Fleet</strong> is:</p><h2 style="font-size:32px;letter-spacing:8px;font-family:monospace">${otp}</h2><p>This code expires in <strong>10 minutes</strong>. Do not share it.</p><p>If you did not request this, please ignore this email.</p><p>— Callbox Fleet</p>`
   });
-  const res = await new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'api.resend.com', path: '/emails', method: 'POST',
-      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
-    }, r => { let d = ''; r.on('data', c => d += c); r.on('end', () => resolve(JSON.parse(d))); });
-    req.on('error', reject); req.write(body); req.end();
-  });
-  if (res.statusCode === 403 || res.name === 'validation_error') throw new Error(res.message || 'Email send failed');
-  return res;
+  return info;
 }
 
 // Local Docker PG (primary) — fallback to Supabase if LOCAL_PG_ONLY not set
@@ -386,6 +387,147 @@ http.createServer(async (req, res) => {
           );
           result = { handoff: r.rows[0] };
           if (r.rows[0]) notifyHandoffUpdate(pg, r.rows[0], 'completed', p.summary || null).catch(() => {});
+        }
+
+      // ── GC Pairing: check if group is paired ─────────────────────────────
+      } else if (fn === 'gc/pairing/check') {
+        // p: { org_id, agent_id, group_chat_id }
+        const r = await pg.query(
+          `SELECT gb.group_chat_id, gb.group_name, gb.department, gb.is_active,
+                  a.name AS owner_name, a.email AS owner_email
+           FROM fleet.gc_bindings gb
+           LEFT JOIN fleet.accounts a ON a.id = gb.owner_account_id
+           WHERE gb.group_chat_id = $1 AND gb.org_id = $2 AND gb.agent_id = $3`,
+          [p.group_chat_id, p.org_id, p.agent_id]
+        );
+        if (r.rows.length > 0) {
+          result = { paired: true, group: r.rows[0] };
+        } else {
+          // Check if pairing is in progress
+          const stateR = await pg.query(
+            `SELECT state, group_name, department, owner_email FROM fleet.gc_pairings
+             WHERE group_chat_id = $1 AND org_id = $2 AND agent_id = $3`,
+            [p.group_chat_id, p.org_id, p.agent_id]
+          );
+          result = {
+            paired: false,
+            pairing_state: stateR.rows[0]?.state || null,
+            pairing_data: stateR.rows[0] || null,
+          };
+        }
+
+      // ── GC Pairing: save step (name, dept, email) ─────────────────────────
+      } else if (fn === 'gc/pairing/step') {
+        // p: { org_id, agent_id, group_chat_id, state, group_name?, department?, owner_email? }
+        const upsertFields = [];
+        const upsertVals = [p.org_id, p.agent_id, p.group_chat_id, p.state];
+        if (p.group_name)  { upsertFields.push(`group_name=$${upsertVals.push(p.group_name)}`); }
+        if (p.department)  { upsertFields.push(`department=$${upsertVals.push(p.department)}`); }
+        if (p.owner_email) { upsertFields.push(`owner_email=$${upsertVals.push(p.owner_email)}`); }
+        upsertFields.push(`updated_at=now()`);
+
+        await pg.query(
+          `INSERT INTO fleet.gc_pairings (org_id, agent_id, group_chat_id, state)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (org_id, group_chat_id, agent_id)
+           DO UPDATE SET state=$4, ${upsertFields.join(', ')}`,
+          upsertVals
+        );
+        result = { success: true, state: p.state };
+
+      // ── GC Pairing: send OTP to group owner email ─────────────────────────
+      } else if (fn === 'gc/pairing/otp/send') {
+        // p: { org_id, agent_id, group_chat_id, email }
+        const acctR = await pg.query(
+          `SELECT id, name, email, is_active FROM fleet.accounts WHERE org_id=$1 AND LOWER(email)=LOWER($2)`,
+          [p.org_id, p.email]
+        );
+        if (!acctR.rows.length) {
+          result = { success: false, reason: 'email_not_found' };
+        } else if (!acctR.rows[0].is_active) {
+          result = { success: false, reason: 'account_inactive' };
+        } else {
+          const otp = String(Math.floor(100000 + Math.random() * 900000));
+          const expires = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+          const otpKey = `gc:${p.group_chat_id}`;
+          await pg.query(
+            `INSERT INTO fleet.otp_verifications (org_id, telegram_id, email, otp_code, expires_at, attempts, verified)
+             VALUES ($1, $2, $3, $4, $5, 0, false)
+             ON CONFLICT (telegram_id, email) DO UPDATE SET otp_code=$4, expires_at=$5, attempts=0, verified=false`,
+            [p.org_id, otpKey, p.email, otp, expires]
+          );
+          // Update pairing state to awaiting_otp
+          await pg.query(
+            `UPDATE fleet.gc_pairings SET state='awaiting_otp', owner_email=$1, updated_at=now()
+             WHERE group_chat_id=$2 AND org_id=$3 AND agent_id=$4`,
+            [p.email, p.group_chat_id, p.org_id, p.agent_id]
+          );
+          try {
+            await sendOTPEmail(acctR.rows[0].email, otp, acctR.rows[0].name);
+            result = { success: true, message: `OTP sent to ${p.email}` };
+          } catch (e) {
+            console.error('[GC OTP] Email failed:', e.message);
+            result = { success: true, message: `OTP sent (email failed: ${e.message})`, _dev_otp: otp };
+          }
+        }
+
+      // ── GC Pairing: verify OTP and finalize GC binding ────────────────────
+      } else if (fn === 'gc/pairing/otp/verify') {
+        // p: { org_id, agent_id, group_chat_id, email, otp_code }
+        const otpKey = `gc:${p.group_chat_id}`;
+        const rowR = await pg.query(
+          `SELECT * FROM fleet.otp_verifications
+           WHERE telegram_id=$1 AND LOWER(email)=LOWER($2) AND verified=false AND expires_at > now()
+           ORDER BY created_at DESC LIMIT 1`,
+          [otpKey, p.email]
+        );
+        if (!rowR.rows.length) {
+          result = { success: false, reason: 'otp_expired_or_not_found' };
+        } else if (rowR.rows[0].attempts >= 3) {
+          result = { success: false, reason: 'too_many_attempts' };
+        } else if (rowR.rows[0].otp_code !== String(p.otp_code).trim()) {
+          await pg.query(`UPDATE fleet.otp_verifications SET attempts=attempts+1 WHERE id=$1`, [rowR.rows[0].id]);
+          const remaining = 3 - (rowR.rows[0].attempts + 1);
+          result = { success: false, reason: 'wrong_otp', attempts_remaining: remaining };
+        } else {
+          // OTP correct — finalize pairing
+          await pg.query(`UPDATE fleet.otp_verifications SET verified=true WHERE id=$1`, [rowR.rows[0].id]);
+
+          // Get pairing data
+          const pairR = await pg.query(
+            `SELECT * FROM fleet.gc_pairings WHERE group_chat_id=$1 AND org_id=$2 AND agent_id=$3`,
+            [p.group_chat_id, p.org_id, p.agent_id]
+          );
+          const pair = pairR.rows[0];
+
+          // Get account
+          const acctR = await pg.query(
+            `SELECT id, name, email, role, department FROM fleet.accounts WHERE org_id=$1 AND LOWER(email)=LOWER($2)`,
+            [p.org_id, p.email]
+          );
+          const account = acctR.rows[0];
+
+          // Create gc_binding
+          await pg.query(
+            `INSERT INTO fleet.gc_bindings (org_id, agent_id, group_chat_id, group_name, department, owner_account_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (org_id, group_chat_id, agent_id) DO UPDATE SET
+               group_name=EXCLUDED.group_name, department=EXCLUDED.department,
+               owner_account_id=EXCLUDED.owner_account_id, is_active=true, bound_at=now()`,
+            [p.org_id, p.agent_id, p.group_chat_id, pair?.group_name || p.group_chat_id, pair?.department || null, account.id]
+          );
+
+          // Mark pairing as paired
+          await pg.query(
+            `UPDATE fleet.gc_pairings SET state='paired', paired_at=now(), owner_account_id=$1, updated_at=now()
+             WHERE group_chat_id=$2 AND org_id=$3 AND agent_id=$4`,
+            [account.id, p.group_chat_id, p.org_id, p.agent_id]
+          );
+
+          result = {
+            success: true,
+            group: { group_name: pair?.group_name, department: pair?.department, owner: { name: account.name, email: account.email } }
+          };
         }
 
       // ── Pairing: check if telegram user is already bound ─────────────────
@@ -744,7 +886,9 @@ http.createServer(async (req, res) => {
           [p.agent_id]
         );
         const agentSlug = agentSlugR.rows[0]?.slug || p.agent_id;
-        const convTitle = `${p.telegram_name} @ ${agentSlug}`;
+        const convTitle = p.group_subject
+          ? `${p.group_subject} @ ${agentSlug}`
+          : `${p.telegram_name} @ ${agentSlug}`;
         const convR = await pg.query(
           `INSERT INTO fleet.conversations (org_id, agent_id, platform, platform_conversation_id, status, title, chat_type, channel)
            VALUES ($1, $2, 'telegram', $3, 'active', $4, $5, 'telegram')
@@ -785,11 +929,23 @@ http.createServer(async (req, res) => {
 
         // 3. Insert message
         const msgR = await pg.query(
-          `INSERT INTO fleet.messages (conversation_id, role, content, platform_message_id, user_id, agent_id)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO fleet.messages (conversation_id, role, content, platform_message_id, user_id, agent_id,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, total_tokens, cost_usd)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            RETURNING id, created_at`,
-          [conversation_id, p.role, p.content, p.platform_message_id || null, user_id, p.agent_id]
+          [conversation_id, p.role, p.content, p.platform_message_id || null, user_id, p.agent_id,
+           p.input_tokens || 0, p.output_tokens || 0, p.cache_read_tokens || 0, p.cache_write_tokens || 0, p.total_tokens || 0, p.cost_usd || 0]
         );
+        // Update conversation token/cost rollup
+        if (p.total_tokens || p.cost_usd) {
+          await pg.query(
+            `UPDATE fleet.conversations SET
+               total_tokens    = COALESCE(total_tokens, 0)    + $1,
+               total_cost_usd  = COALESCE(total_cost_usd, 0)  + $2
+             WHERE id = $3`,
+            [p.total_tokens || 0, p.cost_usd || 0, conversation_id]
+          );
+        }
         result = {
           conversation_id,
           message_id: msgR.rows[0].id,
@@ -817,11 +973,12 @@ http.createServer(async (req, res) => {
       // ── Conversation: load history ────────────────────────────────────────
       // ── Google Workspace OAuth proxy ───────────────────────────────
       } else if (fn.startsWith('google/')) {
-        // Routes: google/token, google/auth/request, google/auth/status, google/session/destroy, google/sessions
-        // Proxies to google-auth service at port 19001
+        // Routes all google/* calls to google-auth-proxy at port 19001
+        // GET endpoints: token, sessions, auth/status, drive/list (when body is empty)
         const GAUTH = 'http://127.0.0.1:19001';
         const route = fn.replace('google/', '/');
-        const method = ['google/token','google/sessions','google/auth/status'].includes(fn) ? 'GET' : 'POST';
+        const GET_ROUTES = ['google/token','google/sessions','google/auth/status'];
+        const method = GET_ROUTES.includes(fn) ? 'GET' : 'POST';
         const fetchUrl = method === 'GET'
           ? `${GAUTH}${route}${p.email ? '?email='+encodeURIComponent(p.email) : ''}${p.state ? '&state='+p.state : ''}`
           : `${GAUTH}${route}`;

@@ -342,6 +342,7 @@ app.post('/api/restart/:instance', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   const send = (d) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch {} };
   const finish = () => { try { res.end(); } catch {} };
@@ -357,7 +358,7 @@ app.post('/api/restart/:instance', async (req, res) => {
     send({ step: 1, label: `Stopped ✓`, status: 'done' });
 
     send({ step: 2, total: 3, label: 'Starting gateway…', status: 'running' });
-    const child = spawn(process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw', ['gateway', 'run', '--port', String(inst.port), '--force'], {
+    const child = spawn(process.env.OPENCLAW_BIN || '/usr/bin/openclaw', ['gateway', 'run', '--port', String(inst.port), '--force'], {
       env: { ...process.env, OPENCLAW_HOME: path.join(os.homedir(), inst.home) },
       detached: true, stdio: 'ignore',
     });
@@ -779,7 +780,7 @@ app.get('/api/skills/:id/details', async (req, res) => {
       pgPool.query(`SELECT id, slug, name, description, category, is_active, instructions, api_endpoint, api_method, request_schema, response_schema FROM fleet.skills WHERE id=$1`, [req.params.id]),
       pgPool.query(`SELECT dsp.department, dsp.is_required, dsp.can_disable FROM fleet.department_skill_presets dsp WHERE dsp.skill_id=$1 AND dsp.tenant_id=$2 ORDER BY dsp.department`, [req.params.id, ORG_ID]),
       pgPool.query(`SELECT srp.department, srp.user_role, srp.can_use, srp.can_configure, srp.can_install, srp.can_remove FROM fleet.skill_role_permissions srp WHERE srp.skill_id=$1 AND srp.tenant_id=$2 ORDER BY srp.department, srp.user_role`, [req.params.id, ORG_ID]),
-      pgPool.query(`SELECT a.name, a.slug, asa.enabled, asa.source FROM fleet.agent_skill_assignments asa JOIN fleet.agents a ON a.id=asa.agent_id WHERE asa.skill_id=$1 AND asa.tenant_id=$2`, [req.params.id, ORG_ID]).catch(() => ({ rows: [] })),
+      pgPool.query(`SELECT a.id, a.name, a.slug, asa.enabled, asa.source FROM fleet.agent_skill_assignments asa JOIN fleet.agents a ON a.id=asa.agent_id WHERE asa.skill_id=$1 AND asa.tenant_id=$2`, [req.params.id, ORG_ID]).catch(() => ({ rows: [] })),
       pgPool.query(`SELECT sc.id, sc.name, sc.endpoint, sc.method, sc.auth_type, sc.headers, sc.timeout_ms, sc.retry_count, sc.is_active, sc.environment, sc.transform_request FROM fleet.skill_callbacks sc WHERE sc.skill_id=$1 AND sc.org_id=$2 ORDER BY sc.name`, [req.params.id, ORG_ID]).catch(() => ({ rows: [] })),
     ]);
     const s = skill.rows[0] || {};
@@ -1580,7 +1581,7 @@ app.post('/api/agents/spawn', async (req, res) => {
     // Step 8: Start the instance
     send({ step: 8, total: TOTAL, label: `Starting agent on port ${assignedPort}...`, status: 'running' });
     const child = spawn(
-      process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw',
+      process.env.OPENCLAW_BIN || '/usr/bin/openclaw',
       ['gateway', 'run', '--port', String(assignedPort), '--force'],
       {
         env: { ...process.env, OPENCLAW_HOME: agentHome },
@@ -1620,7 +1621,7 @@ app.post('/api/agents/spawn', async (req, res) => {
 // ── Agent Spawner ────────────────────────────────────────────────────────────
 const { execFile, spawn: spawnProc } = require('child_process');
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
-const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw';
+const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/usr/bin/openclaw';
 const ANTHRO_KEY_FILE = path.join(os.homedir(), 'cbfleet-rag-sales/.openclaw/agents/main/agent/auth-profiles.json');
 
 async function getNextPort() {
@@ -1985,9 +1986,12 @@ app.post('/api/agents/restart-all', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
   res.flushHeaders();
   const send = (d) => { try { res.write(`data: ${JSON.stringify(d)}\n\n`); } catch {} };
   const finish = () => { try { res.end(); } catch {} };
+  // Keepalive heartbeat — prevents nginx from closing idle SSE streams
+  const keepalive = setInterval(() => { try { res.write(': ping\n\n'); } catch {} }, 5000);
 
   try {
     const instances = await getInstances();
@@ -2004,7 +2008,7 @@ app.post('/api/agents/restart-all', async (req, res) => {
       await killPort(inst.port);
 
       send({ step: i + 1, total, name: inst.displayName, status: 'starting', log: `Starting ${inst.displayName}…` });
-      const child = spawn(process.env.OPENCLAW_BIN || '/usr/local/bin/openclaw',
+      const child = spawn(process.env.OPENCLAW_BIN || '/usr/bin/openclaw',
         ['gateway', 'run', '--port', String(inst.port), '--force'],
         { env: { ...process.env, OPENCLAW_HOME: path.join(os.homedir(), inst.home) }, detached: true, stdio: 'ignore' }
       );
@@ -2027,6 +2031,7 @@ app.post('/api/agents/restart-all', async (req, res) => {
   } catch (err) {
     send({ error: err.message });
   }
+  clearInterval(keepalive);
   finish();
 });
 
@@ -2298,6 +2303,125 @@ app.get('/api/sessions/reports', async (req, res) => {
   } catch (err) {
     res.status(502).json({ error: 'Proxy unreachable', detail: err.message });
   }
+});
+
+// GET /api/reports/cost — cost & token analysis report
+// Query params: period=7|30|90 (days), agent_id (optional)
+app.get('/api/reports/cost', async (req, res) => {
+  const period = parseInt(req.query.period || '30', 10);
+  const agent_id = req.query.agent_id || null;
+  try {
+    const agentFilter = agent_id ? 'AND m.agent_id = $3' : '';
+    const params = agent_id ? [ORG_ID, period, agent_id] : [ORG_ID, period];
+
+    const summaryQ = await pgPool.query(
+      `SELECT
+         COUNT(DISTINCT m.conversation_id)                         AS total_conversations,
+         COUNT(*) FILTER (WHERE m.role = 'assistant')              AS total_assistant_turns,
+         COALESCE(SUM(m.total_tokens), 0)                          AS total_tokens,
+         COALESCE(SUM(m.cost_usd), 0)                              AS total_cost_usd,
+         COALESCE(SUM(m.input_tokens), 0)                          AS input_tokens,
+         COALESCE(SUM(m.output_tokens), 0)                         AS output_tokens,
+         COALESCE(SUM(m.cache_read_tokens), 0)                     AS cache_read_tokens,
+         COALESCE(SUM(m.cache_write_tokens), 0)                    AS cache_write_tokens
+       FROM fleet.messages m
+       JOIN fleet.conversations c ON c.id = m.conversation_id
+       WHERE c.org_id = $1
+         AND m.created_at >= NOW() - ($2 || ' days')::interval
+         ${agentFilter}`,
+      params
+    );
+
+    const byAgentQ = await pgPool.query(
+      `SELECT
+         a.name AS agent_name, a.slug,
+         COALESCE(SUM(m.cost_usd), 0)     AS total_cost_usd,
+         COALESCE(SUM(m.total_tokens), 0)  AS total_tokens,
+         COUNT(*) FILTER (WHERE m.role = 'assistant') AS turns
+       FROM fleet.messages m
+       JOIN fleet.conversations c ON c.id = m.conversation_id
+       JOIN fleet.agents a ON a.id = m.agent_id
+       WHERE c.org_id = $1
+         AND m.created_at >= NOW() - ($2 || ' days')::interval
+       GROUP BY a.id, a.name, a.slug
+       ORDER BY total_cost_usd DESC`,
+      [ORG_ID, period]
+    );
+
+    const byDayQ = await pgPool.query(
+      `SELECT
+         DATE_TRUNC('day', m.created_at)::date AS day,
+         COALESCE(SUM(m.cost_usd), 0)     AS cost_usd,
+         COALESCE(SUM(m.total_tokens), 0)  AS total_tokens
+       FROM fleet.messages m
+       JOIN fleet.conversations c ON c.id = m.conversation_id
+       WHERE c.org_id = $1
+         AND m.created_at >= NOW() - ($2 || ' days')::interval
+         ${agentFilter}
+       GROUP BY 1
+       ORDER BY 1 ASC`,
+      params
+    );
+
+    const topConvsQ = await pgPool.query(
+      `SELECT
+         c.id, c.title, c.total_cost_usd, c.total_tokens,
+         a.name AS agent_name, a.slug,
+         c.started_at, c.last_message_at
+       FROM fleet.conversations c
+       JOIN fleet.agents a ON a.id = c.agent_id
+       WHERE c.org_id = $1
+         AND c.started_at >= NOW() - ($2 || ' days')::interval
+         ${agent_id ? 'AND c.agent_id = $3' : ''}
+       ORDER BY c.total_cost_usd DESC
+       LIMIT 10`,
+      params
+    );
+
+    res.json({
+      period_days: period,
+      summary: summaryQ.rows[0],
+      by_agent: byAgentQ.rows,
+      by_day: byDayQ.rows,
+      top_conversations: topConvsQ.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/gc-bindings — list all paired group chats
+app.get('/api/gc-bindings', async (req, res) => {
+  try {
+    const r = await pgPool.query(
+      `SELECT gb.id, gb.group_chat_id, gb.group_name, gb.department, gb.is_active, gb.bound_at,
+              a.name AS agent_name, a.slug AS agent_slug,
+              acc.name AS owner_name, acc.email AS owner_email
+       FROM fleet.gc_bindings gb
+       JOIN fleet.agents a ON a.id = gb.agent_id
+       LEFT JOIN fleet.accounts acc ON acc.id = gb.owner_account_id
+       WHERE gb.org_id = $1
+       ORDER BY gb.bound_at DESC`,
+      [ORG_ID]
+    );
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/gc-pairings — list in-progress pairings
+app.get('/api/gc-pairings', async (req, res) => {
+  try {
+    const r = await pgPool.query(
+      `SELECT gp.group_chat_id, gp.group_name, gp.department, gp.owner_email, gp.state, gp.created_at,
+              a.name AS agent_name, a.slug AS agent_slug
+       FROM fleet.gc_pairings gp
+       JOIN fleet.agents a ON a.id = gp.agent_id
+       WHERE gp.org_id = $1 AND gp.state != 'paired'
+       ORDER BY gp.created_at DESC`,
+      [ORG_ID]
+    );
+    res.json(r.rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // SPA fallback — serve index.html for all non-API routes

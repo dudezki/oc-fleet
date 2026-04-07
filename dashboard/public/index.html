@@ -1892,17 +1892,18 @@ const Skills = {
                     </div>
                     <button @click="toggleAgentAssign(agent)"
                       :disabled="drawer.togglingAgent === agent.id"
-                      :class="drawer.assignedAgentIds.has(agent.id)
-                        ? 'bg-blue-600 hover:bg-red-600 hover:border-red-500 text-white border-blue-500'
-                        : 'bg-gray-700 hover:bg-blue-600 hover:border-blue-500 hover:text-white text-gray-400 border-gray-600'"
-                      class="flex items-center gap-1.5 px-3 py-1 rounded-full border text-xs transition-all disabled:opacity-50 group">
-                      <span v-if="drawer.togglingAgent === agent.id">…</span>
-                      <template v-else-if="drawer.assignedAgentIds.has(agent.id)">
-                        <span class="group-hover:hidden">✓ Assigned</span>
-                        <span class="hidden group-hover:inline">✕ Unassign</span>
-                      </template>
+                      class="flex items-center gap-2 text-xs transition-all disabled:opacity-50">
+                      <span v-if="drawer.togglingAgent === agent.id" class="text-gray-500">…</span>
                       <template v-else>
-                        <span>+ Assign</span>
+                        <span :class="drawer.assignedAgentIds.has(agent.id) ? 'text-blue-400' : 'text-gray-500'">
+                          {{ drawer.assignedAgentIds.has(agent.id) ? 'Assigned' : 'Unassigned' }}
+                        </span>
+                        <!-- Toggle switch -->
+                        <div :class="drawer.assignedAgentIds.has(agent.id) ? 'bg-blue-600' : 'bg-gray-600'"
+                          class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors">
+                          <span :class="drawer.assignedAgentIds.has(agent.id) ? 'translate-x-4' : 'translate-x-1'"
+                            class="inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform"></span>
+                        </div>
                       </template>
                     </button>
                   </div>
@@ -3996,7 +3997,7 @@ const Sessions = {
     }
 
     function chatTypeLabel(s) {
-      if (s.is_group) return { label: '👥 GC', cls: 'bg-green-900/50 text-green-300 border-green-700' };
+      if (s.is_group || s.chat_type === 'group') return { label: '👥 GC', cls: 'bg-green-900/50 text-green-300 border-green-700' };
       return { label: '💬 DM', cls: 'bg-gray-800 text-gray-400 border-gray-700' };
     }
 
@@ -4188,24 +4189,27 @@ const Reports = {
 
     const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
-    const grid = computed(() => {
+    function buildGrid(rows) {
       const map = {};
       let max = 0;
-      for (const r of heatmap.value) {
+      for (const r of rows) {
         map[`${r.day_of_week}-${r.hour}`] = r.message_count;
         if (r.message_count > max) max = r.message_count;
       }
-      const rows = [];
+      const grid = [];
       for (let d = 0; d < 7; d++) {
         const cells = [];
         for (let h = 0; h < 24; h++) {
           const v = map[`${d}-${h}`] || 0;
           cells.push({ hour: h, value: v, intensity: max ? v / max : 0 });
         }
-        rows.push({ day: DAYS[d], cells });
+        grid.push({ day: DAYS[d], cells });
       }
-      return { rows, max };
-    });
+      return { rows: grid, max };
+    }
+
+    const currentGrid = computed(() => buildGrid(heatmap.value.filter(r => r.week === 'current')));
+    const previousGrid = computed(() => buildGrid(heatmap.value.filter(r => r.week === 'previous')));
 
     function cellColor(intensity) {
       if (intensity === 0) return '#1f2937';
@@ -4229,7 +4233,7 @@ const Reports = {
       loading.value = false;
     });
 
-    return { loading, error, grid, stats, cellColor, DAYS };
+    return { loading, error, currentGrid, previousGrid, stats, cellColor, DAYS };
   },
   template: `
     <div class="p-6">
@@ -4257,38 +4261,77 @@ const Reports = {
           </div>
         </div>
 
-        <!-- Activity Heatmap -->
+        <!-- Activity Heatmap: Side by Side -->
         <div class="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-6">
-          <h2 class="text-sm font-semibold text-gray-300 mb-4">Activity Heatmap <span class="text-gray-600 font-normal text-xs">(last 30 days · Asia/Manila)</span></h2>
-          <div v-if="!grid.max" class="text-gray-600 text-xs py-4">No heatmap data</div>
-          <div v-else class="overflow-x-auto">
-            <table class="text-[10px] border-separate border-spacing-0.5">
-              <thead>
-                <tr>
-                  <th class="w-8 text-gray-600 font-normal pr-1"></th>
-                  <th v-for="h in 24" :key="h" class="w-5 text-gray-600 font-normal text-center">{{ String(h-1).padStart(2,'0') }}</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="row in grid.rows" :key="row.day">
-                  <td class="text-gray-500 pr-2 font-mono whitespace-nowrap">{{ row.day }}</td>
-                  <td v-for="cell in row.cells" :key="cell.hour"
-                      class="w-5 h-4 rounded-sm cursor-default"
-                      :style="{ background: cellColor(cell.intensity) }"
-                      :title="row.day + ' ' + String(cell.hour).padStart(2,'0') + ':00 — ' + cell.value + ' msg' + (cell.value!==1?'s':'')">
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-            <div class="flex items-center gap-1 mt-3 text-[10px] text-gray-500">
-              <span class="mr-1">Less</span>
-              <div v-for="i in [0, 0.25, 0.5, 0.75, 1]" :key="i" class="w-4 h-3 rounded-sm" :style="{ background: cellColor(i) }"></div>
-              <span class="ml-1">More</span>
+          <h2 class="text-sm font-semibold text-gray-300 mb-5">Activity Heatmap <span class="text-gray-600 font-normal text-xs">(Asia/Manila)</span></h2>
+          <div class="grid grid-cols-1 xl:grid-cols-2 gap-6">
+
+            <!-- Previous Week -->
+            <div>
+              <div class="text-xs font-medium text-gray-400 mb-3 uppercase tracking-wider">Previous Week</div>
+              <div v-if="!previousGrid.max" class="text-gray-600 text-xs py-4">No data for previous week</div>
+              <div v-else class="overflow-x-auto">
+                <table class="text-[10px] border-separate border-spacing-0.5">
+                  <thead>
+                    <tr>
+                      <th class="w-8 text-gray-600 font-normal pr-1"></th>
+                      <th v-for="h in 24" :key="h" class="w-5 text-gray-600 font-normal text-center">{{ String(h-1).padStart(2,'0') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in previousGrid.rows" :key="row.day">
+                      <td class="text-gray-500 pr-2 font-mono whitespace-nowrap">{{ row.day }}</td>
+                      <td v-for="cell in row.cells" :key="cell.hour"
+                          class="w-5 h-4 rounded-sm cursor-default"
+                          :style="{ background: cellColor(cell.intensity) }"
+                          :title="row.day + ' ' + String(cell.hour).padStart(2,'0') + ':00 — ' + cell.value + ' msg' + (cell.value!==1?'s':'')" >
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="flex items-center gap-1 mt-3 text-[10px] text-gray-500">
+                  <span class="mr-1">Less</span>
+                  <div v-for="i in [0, 0.25, 0.5, 0.75, 1]" :key="i" class="w-4 h-3 rounded-sm" :style="{ background: cellColor(i) }"></div>
+                  <span class="ml-1">More</span>
+                </div>
+              </div>
             </div>
+
+            <!-- Current Week -->
+            <div>
+              <div class="text-xs font-medium text-blue-400 mb-3 uppercase tracking-wider">This Week</div>
+              <div v-if="!currentGrid.max" class="text-gray-600 text-xs py-4">No data yet this week</div>
+              <div v-else class="overflow-x-auto">
+                <table class="text-[10px] border-separate border-spacing-0.5">
+                  <thead>
+                    <tr>
+                      <th class="w-8 text-gray-600 font-normal pr-1"></th>
+                      <th v-for="h in 24" :key="h" class="w-5 text-gray-600 font-normal text-center">{{ String(h-1).padStart(2,'0') }}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="row in currentGrid.rows" :key="row.day">
+                      <td class="text-gray-500 pr-2 font-mono whitespace-nowrap">{{ row.day }}</td>
+                      <td v-for="cell in row.cells" :key="cell.hour"
+                          class="w-5 h-4 rounded-sm cursor-default"
+                          :style="{ background: cellColor(cell.intensity) }"
+                          :title="row.day + ' ' + String(cell.hour).padStart(2,'0') + ':00 — ' + cell.value + ' msg' + (cell.value!==1?'s':'')" >
+                      </td>
+                    </tr>
+                  </tbody>
+                </table>
+                <div class="flex items-center gap-1 mt-3 text-[10px] text-gray-500">
+                  <span class="mr-1">Less</span>
+                  <div v-for="i in [0, 0.25, 0.5, 0.75, 1]" :key="i" class="w-4 h-3 rounded-sm" :style="{ background: cellColor(i) }"></div>
+                  <span class="ml-1">More</span>
+                </div>
+              </div>
+            </div>
+
           </div>
         </div>
 
-        <!-- By agent -->
+                <!-- By agent -->
         <div v-if="stats && stats.by_agent && stats.by_agent.length" class="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <h2 class="text-sm font-semibold text-gray-300 mb-4">Sessions by Agent</h2>
           <div class="space-y-2">

@@ -28,7 +28,7 @@ const TOKEN_DIR = process.env.TOKEN_STORE_DIR || path.join(require('os').homedir
 const ALLOWED_DOMAIN = 'callboxinc.com';
 
 // REDIRECT_URI loaded from DB skill_callbacks at startup (set via dashboard or SQL)
-let REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'https://YOUR_VM_DOMAIN/google-auth/callback';
+let REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'https://oc.callboxinc.ai/callback/google';
 
 async function loadRedirectUriFromDb() {
   const pg = new Client({ connectionString: DB_URL });
@@ -301,7 +301,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ── OAuth callback from Google ──────────────────────────────────────────────
-  if (parsed.pathname === '/google-auth/callback' || parsed.pathname === '/callback') {
+  if (parsed.pathname === '/google-auth/callback' || parsed.pathname === '/callback' || parsed.pathname === '/callback/google') {
     const { code, state, error } = parsed.query;
 
     if (error) {
@@ -363,6 +363,265 @@ p{font-size:13px;color:#64748b;line-height:1.6;}
       console.error('[google-auth] callback error:', err.message);
       return html(500, '<h2>Auth failed. Please try again.</h2>');
     }
+  }
+
+  // ── Google API helpers ───────────────────────────────────────────────────────
+
+  async function getAccessToken(email) {
+    let s = getSession(email);
+    if (!s) {
+      const saved = loadRefreshToken(email);
+      if (!saved) throw { status: 401, reason: 'auth_required', message: `No session for ${email} — auth required.` };
+      const stub = { email, refresh_token: saved, access_token: null, expires_at: 0, _idleTimer: null };
+      sessions.set(email, stub);
+      await refreshAccessToken(stub);
+      s = stub;
+      touchSession(email);
+    }
+    if (!s.access_token || (s.expires_at && Date.now() > s.expires_at - 60000)) {
+      await refreshAccessToken(s);
+    }
+    return s.access_token;
+  }
+
+  async function gapi(method, url, token, body) {
+    return new Promise((resolve, reject) => {
+      const u = new URL(url);
+      const options = {
+        hostname: u.hostname, path: u.pathname + u.search, method,
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      };
+      const req = https.request(options, res => {
+        let d = ''; res.on('data', c => d += c);
+        res.on('end', () => { try { resolve(JSON.parse(d)); } catch { resolve({ _raw: d }); } });
+      });
+      req.on('error', reject);
+      if (body) req.write(JSON.stringify(body));
+      req.end();
+    });
+  }
+
+  const body = await readBody();
+  let p = {};
+  try { p = JSON.parse(body); } catch {}
+
+  // ── Docs ────────────────────────────────────────────────────────────────────
+  if (parsed.pathname === '/docs/create' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const doc = await gapi('POST', 'https://docs.googleapis.com/v1/documents', token, { title: p.title || 'Untitled' });
+      if (p.content && doc.documentId) {
+        await gapi('POST', `https://docs.googleapis.com/v1/documents/${doc.documentId}:batchUpdate`, token, {
+          requests: [{ insertText: { location: { index: 1 }, text: p.content } }]
+        });
+      }
+      return json(200, { ok: true, doc_id: doc.documentId, url: `https://docs.google.com/document/d/${doc.documentId}/edit`, title: doc.title });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/docs/get' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const docId = p.doc_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.doc_id;
+      const doc = await gapi('GET', `https://docs.googleapis.com/v1/documents/${docId}`, token);
+      const text = doc.body?.content?.map(el => el.paragraph?.elements?.map(e => e.textRun?.content || '').join('')).join('') || '';
+      return json(200, { ok: true, doc_id: docId, title: doc.title, content: text });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/docs/update' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const docId = p.doc_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.doc_id;
+      const doc = await gapi('GET', `https://docs.googleapis.com/v1/documents/${docId}`, token);
+      const endIndex = doc.body?.content?.slice(-1)[0]?.endIndex || 1;
+      const requests = p.mode === 'replace'
+        ? [
+            { deleteContentRange: { range: { startIndex: 1, endIndex: endIndex - 1 } } },
+            { insertText: { location: { index: 1 }, text: p.content } }
+          ]
+        : [{ insertText: { location: { index: endIndex - 1 }, text: '\n' + p.content } }];
+      await gapi('POST', `https://docs.googleapis.com/v1/documents/${docId}:batchUpdate`, token, { requests });
+      return json(200, { ok: true, doc_id: docId, url: `https://docs.google.com/document/d/${docId}/edit` });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/docs/delete' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const docId = p.doc_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.doc_id;
+      await gapi('DELETE', `https://www.googleapis.com/drive/v3/files/${docId}`, token);
+      return json(200, { ok: true, doc_id: docId, trashed: true });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  // ── Sheets ──────────────────────────────────────────────────────────────────
+  if (parsed.pathname === '/sheets/create' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const sheet = await gapi('POST', 'https://sheets.googleapis.com/v4/spreadsheets', token, {
+        properties: { title: p.title || 'Untitled Spreadsheet' },
+        sheets: [{ properties: { title: 'Sheet1' } }]
+      });
+      if (p.data && sheet.spreadsheetId) {
+        await gapi('PUT', `https://sheets.googleapis.com/v4/spreadsheets/${sheet.spreadsheetId}/values/Sheet1!A1?valueInputOption=USER_ENTERED`, token, { values: p.data });
+      }
+      return json(200, { ok: true, sheet_id: sheet.spreadsheetId, url: sheet.spreadsheetUrl, title: sheet.properties?.title });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/sheets/read' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const sheetId = p.sheet_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.sheet_id;
+      const range = p.range || 'Sheet1!A1:Z1000';
+      const r = await gapi('GET', `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}`, token);
+      return json(200, { ok: true, sheet_id: sheetId, range: r.range, values: r.values || [] });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/sheets/write' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const sheetId = p.sheet_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.sheet_id;
+      const range = p.range || 'Sheet1!A1';
+      const mode = p.mode === 'append' ? 'append' : 'values';
+      const url = mode === 'append'
+        ? `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}:append?valueInputOption=USER_ENTERED`
+        : `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(range)}?valueInputOption=USER_ENTERED`;
+      const method = mode === 'append' ? 'POST' : 'PUT';
+      const r = await gapi(method, url, token, { values: p.values });
+      return json(200, { ok: true, updated_rows: r.updates?.updatedRows || r.updates?.updatedCells });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/sheets/delete' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const sheetId = p.sheet_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.sheet_id;
+      await gapi('DELETE', `https://www.googleapis.com/drive/v3/files/${sheetId}`, token);
+      return json(200, { ok: true, sheet_id: sheetId, trashed: true });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  // ── Slides ──────────────────────────────────────────────────────────────────
+  if (parsed.pathname === '/slides/create' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const pres = await gapi('POST', 'https://slides.googleapis.com/v1/presentations', token, { title: p.title || 'Untitled Presentation' });
+      return json(200, { ok: true, presentation_id: pres.presentationId, url: `https://docs.google.com/presentation/d/${pres.presentationId}/edit`, title: pres.title });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/slides/get' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const presId = p.presentation_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.presentation_id;
+      const pres = await gapi('GET', `https://slides.googleapis.com/v1/presentations/${presId}`, token);
+      return json(200, { ok: true, presentation_id: presId, title: pres.title, slide_count: pres.slides?.length || 0, url: `https://docs.google.com/presentation/d/${presId}/edit` });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/slides/delete' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const presId = p.presentation_id?.replace(/.*\/d\/([^/]+).*/, '$1') || p.presentation_id;
+      await gapi('DELETE', `https://www.googleapis.com/drive/v3/files/${presId}`, token);
+      return json(200, { ok: true, presentation_id: presId, trashed: true });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  // ── Drive ───────────────────────────────────────────────────────────────────
+  if (parsed.pathname === '/drive/list' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const q = p.query ? encodeURIComponent(p.query) : '';
+      const limit = p.limit || 20;
+      const url = `https://www.googleapis.com/drive/v3/files?pageSize=${limit}&fields=files(id,name,mimeType,webViewLink,modifiedTime)${q ? '&q=' + q : ''}`;
+      const r = await gapi('GET', url, token);
+      return json(200, { ok: true, files: r.files || [] });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/drive/delete' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      await gapi('DELETE', `https://www.googleapis.com/drive/v3/files/${p.file_id}`, token);
+      return json(200, { ok: true, file_id: p.file_id, trashed: true });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/drive/share' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const perm = p.share_with === 'anyone'
+        ? { type: 'anyone', role: p.role || 'reader' }
+        : { type: 'user', role: p.role || 'reader', emailAddress: p.share_with };
+      await gapi('POST', `https://www.googleapis.com/drive/v3/files/${p.file_id}/permissions`, token, perm);
+      return json(200, { ok: true, file_id: p.file_id, shared_with: p.share_with, role: p.role || 'reader' });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  // ── Gmail ───────────────────────────────────────────────────────────────────
+  if (parsed.pathname === '/gmail/send' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const raw = Buffer.from(
+        `From: ${p.email}\r\nTo: ${p.to}\r\nSubject: ${p.subject}\r\nContent-Type: ${p.html ? 'text/html' : 'text/plain'}; charset=utf-8\r\n\r\n${p.body}`
+      ).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+      const r = await gapi('POST', 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send', token, { raw });
+      return json(200, { ok: true, message_id: r.id, thread_id: r.threadId });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/gmail/read' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const limit = p.limit || 10;
+      const q = p.query ? `&q=${encodeURIComponent(p.query)}` : '';
+      const list = await gapi('GET', `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${limit}${q}`, token);
+      const messages = await Promise.all((list.messages || []).slice(0, limit).map(async m => {
+        const msg = await gapi('GET', `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=From,Subject,Date`, token);
+        const headers = Object.fromEntries((msg.payload?.headers || []).map(h => [h.name, h.value]));
+        return { id: m.id, from: headers.From, subject: headers.Subject, date: headers.Date, snippet: msg.snippet };
+      }));
+      return json(200, { ok: true, messages });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  // ── Calendar ─────────────────────────────────────────────────────────────────
+  if (parsed.pathname === '/calendar/list' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const now = new Date().toISOString();
+      const end = new Date(Date.now() + (p.days_ahead || 7) * 86400000).toISOString();
+      const limit = p.limit || 10;
+      const r = await gapi('GET', `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(now)}&timeMax=${encodeURIComponent(end)}&maxResults=${limit}&singleEvents=true&orderBy=startTime`, token);
+      const events = (r.items || []).map(e => ({ id: e.id, title: e.summary, start: e.start?.dateTime || e.start?.date, end: e.end?.dateTime || e.end?.date, location: e.location, link: e.htmlLink }));
+      return json(200, { ok: true, events });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/calendar/create' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      const event = {
+        summary: p.title, description: p.description,
+        start: { dateTime: p.start, timeZone: 'Asia/Manila' },
+        end: { dateTime: p.end, timeZone: 'Asia/Manila' },
+        attendees: (p.attendees || []).map(e => ({ email: e })),
+      };
+      const r = await gapi('POST', 'https://www.googleapis.com/calendar/v3/calendars/primary/events', token, event);
+      return json(200, { ok: true, event_id: r.id, url: r.htmlLink, title: r.summary });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
+  }
+
+  if (parsed.pathname === '/calendar/delete' && req.method === 'POST') {
+    try {
+      const token = await getAccessToken(p.email);
+      await gapi('DELETE', `https://www.googleapis.com/calendar/v3/calendars/primary/events/${p.event_id}`, token);
+      return json(200, { ok: true, event_id: p.event_id, deleted: true });
+    } catch (e) { return json(e.status || 500, { error: e.message, reason: e.reason }); }
   }
 
   res.writeHead(404);

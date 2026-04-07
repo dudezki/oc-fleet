@@ -54,6 +54,25 @@ function extractSenderName(raw) {
   return m ? m[1] : null;
 }
 
+function extractChatId(raw) {
+  // Try inbound_meta chat_id field first (e.g. "chat_id": "telegram:-5117379505")
+  const metaM = raw.match(/"chat_id":\s*"(?:telegram:)?(-?\d+)"/);
+  if (metaM) return metaM[1];
+  // Fallback: conversation_label format "CB Fleet GC id:-5117379505"
+  const labelM = raw.match(/id:(-\d+)/);
+  if (labelM) return labelM[1];
+  return null;
+}
+
+function extractIsGroup(raw) {
+  return /"is_group_chat":\s*true/.test(raw) || /"chat_type":\s*"group"/.test(raw);
+}
+
+function extractGroupSubject(raw) {
+  const m = raw.match(/"group_subject":\s*"([^"]+)"/);
+  return m ? m[1] : null;
+}
+
 function cleanContent(raw) {
   return raw
     .replace(/Conversation info \(untrusted metadata\):[\s\S]*?(?=\n\n|\n[A-Z#]|$)/g, '')
@@ -88,6 +107,13 @@ async function syncAgent(agent) {
     const toSync = [];
     let latestTs = lastTs;
 
+    // Track last seen GC context so assistant messages inherit the correct conversation bucket
+    let lastChatId = null;
+    let lastIsGroup = false;
+    let lastGroupSubject = null;
+    let lastTelegramId = null;
+    let lastTelegramName = null;
+
     for (const line of lines) {
       try {
         const d = JSON.parse(line);
@@ -104,12 +130,31 @@ async function syncAgent(agent) {
           ? msg.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
           : String(msg.content || '');
 
-        // Extract telegram metadata from user messages
+        // Extract telegram metadata from user messages; assistant messages inherit last seen context
         let telegram_id = null;
         let telegram_name = null;
+        let chat_id = null;
+        let is_group = false;
+        let group_subject = null;
         if (msg.role === 'user') {
-          telegram_id = extractTelegramId(rawText);
-          telegram_name = extractSenderName(rawText);
+          telegram_id = extractTelegramId(rawText) || lastTelegramId;
+          telegram_name = extractSenderName(rawText) || lastTelegramName;
+          chat_id = extractChatId(rawText);
+          is_group = extractIsGroup(rawText);
+          if (is_group) group_subject = extractGroupSubject(rawText);
+          // Update rolling context
+          lastChatId = chat_id || lastChatId;
+          lastIsGroup = is_group || lastIsGroup;
+          lastGroupSubject = group_subject || lastGroupSubject;
+          lastTelegramId = telegram_id || lastTelegramId;
+          lastTelegramName = telegram_name || lastTelegramName;
+        } else {
+          // Assistant message — inherit context from last user message
+          telegram_id = lastTelegramId;
+          telegram_name = lastTelegramName;
+          chat_id = lastChatId;
+          is_group = lastIsGroup;
+          group_subject = lastGroupSubject;
         }
 
         const content = cleanContent(rawText);
@@ -118,26 +163,48 @@ async function syncAgent(agent) {
         // Skip heartbeat/system noise
         if (msg.role === 'user' && content.includes('Read HEARTBEAT.md')) continue;
         if (msg.role === 'assistant' && content.trim() === 'HEARTBEAT_OK') continue;
+        if (msg.role === 'assistant' && content.trim() === 'NO_REPLY') continue;
 
-        toSync.push({ role: msg.role, content: content.slice(0, 4000), telegram_id, telegram_name, ts });
+        let usage = {};
+        if (msg.role === 'assistant' && msg.usage && msg.usage.totalTokens > 0) {
+          usage = {
+            input_tokens:       msg.usage.input       || 0,
+            output_tokens:      msg.usage.output      || 0,
+            cache_read_tokens:  msg.usage.cacheRead   || 0,
+            cache_write_tokens: msg.usage.cacheWrite  || 0,
+            total_tokens:       msg.usage.totalTokens || 0,
+            cost_usd:           msg.usage.cost?.total || 0,
+          };
+        }
+        toSync.push({ role: msg.role, content: content.slice(0, 4000), telegram_id, telegram_name, chat_id, is_group, group_subject, ts, ...usage });
       } catch {}
     }
 
     if (!toSync.length) continue;
 
-    // Group consecutive messages by telegram_id for efficient logging
+    // Group consecutive messages by telegram_id / chat_id for efficient logging
     for (const msg of toSync) {
       const tid = msg.telegram_id || '6759764460'; // fallback to org owner
+      // For group chats, use the group chat ID as the conversation bucket
+      const convId = (msg.is_group && msg.chat_id) ? msg.chat_id : tid;
+      const chatType = msg.is_group ? 'group' : 'direct';
       const res = await post('conversation/log', {
         org_id: ORG_ID,
         agent_id: agent.id,
         telegram_id: tid,
         telegram_name: msg.telegram_name || null,
-        chat_type: 'direct',
+        group_subject: msg.group_subject || null,
+        chat_type: chatType,
         platform: 'telegram',
-        platform_conversation_id: tid,
+        platform_conversation_id: convId,
         role: msg.role,
         content: msg.content,
+        input_tokens:       msg.input_tokens       || 0,
+        output_tokens:      msg.output_tokens      || 0,
+        cache_read_tokens:  msg.cache_read_tokens  || 0,
+        cache_write_tokens: msg.cache_write_tokens || 0,
+        total_tokens:       msg.total_tokens       || 0,
+        cost_usd:           msg.cost_usd           || 0,
       });
       if (res.conversation_id || res.message_id) totalSynced++;
     }

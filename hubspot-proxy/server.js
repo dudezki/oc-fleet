@@ -2,6 +2,12 @@ import express from 'express';
 import axios from 'axios';
 import { readFileSync, appendFileSync, existsSync } from 'fs';
 import { join } from 'path';
+import pg from 'pg';
+const { Pool } = pg;
+
+const dbPool = new Pool({
+  connectionString: process.env.DATABASE_URL || 'postgresql://postgres:fleetdev@127.0.0.1:5433/fleet_dev',
+});
 
 const app = express();
 app.use(express.json());
@@ -120,56 +126,113 @@ async function resolveOwner(email, token) {
   return { ownerId: owner.id, teams: owner.teams || [], primaryTeam: owner.teams?.[0] || null };
 }
 
+// --- DB identity lookup (user_integrations) ---
+
+async function resolveIdentityFromDB(email, portalId) {
+  const pid = String(portalId);
+  const result = await dbPool.query(
+    `SELECT ui.meta, ui.credentials, ui.access_level, ui.enabled, ui.scopes,
+            a.email as account_email
+     FROM fleet.user_integrations ui
+     JOIN fleet.accounts a ON a.id = ui.account_id
+     WHERE a.email = $1 AND ui.integration = 'hubspot' AND ui.portal_id = $2 AND ui.enabled = true
+     LIMIT 1`,
+    [email, pid]
+  );
+  if (result.rows.length === 0) return null;
+  const row = result.rows[0];
+  return {
+    email,
+    name: row.meta?.name || email,
+    position: row.meta?.position || null,
+    department: row.meta?.department || null,
+    positionGroup: row.meta?.roles?.includes('system_developer') ? 'Dev_IT' : 'Dev_IT',
+    accessLevel: row.access_level || 'standard',
+    allowedPortals: [pid],
+    allowedObjects: ['contacts', 'companies', 'deals', 'owners', '2-20106951'],
+    topics: [],
+    canWrite: true,
+    writeScope: 'any',
+    database: true,
+    ownerId: row.meta?.owner_id || null,
+    hubspotTeams: [],
+    primaryTeam: null,
+    proxyEnabled: true,
+    token: null, // resolved separately via getToken
+    _source: 'db',
+  };
+}
+
 // --- Full identity resolution ---
 
 async function resolveIdentity(email, portalId) {
   const cached = getCached(email, portalId);
   if (cached) return cached;
 
-  const rt = loadRoutingTable();
-  const userDir = rt.userDirectory || {};
-
-  const user = userDir[email];
-  if (!user) throw new Error(`User not found in routing table: ${email}`);
-
-  const group = resolvePositionGroup(email, user.position, rt);
-
-  if (!group) {
-    throw new Error(`No position group found for ${email} (position: ${user.position}). Access denied.`);
+  // Priority 1: fleet.user_integrations DB
+  let user = null;
+  let identity = null;
+  try {
+    identity = await resolveIdentityFromDB(email, portalId);
+    if (identity) {
+      console.log(`[identity] Resolved ${email} from DB (user_integrations)`);
+    }
+  } catch (err) {
+    console.error(`[identity] DB lookup failed for ${email}:`, err.message);
   }
 
-  const allowedPortals = group.portal || [];
-  if (allowedPortals.length > 0 && !allowedPortals.includes(String(portalId))) {
-    throw new Error(`Portal ${portalId} not authorized for ${email} (group: ${group._groupName}, allowed: ${allowedPortals.join(', ')})`);
+  // Priority 2: routing-table.json fallback
+  if (!identity) {
+    const rt = loadRoutingTable();
+    const userDir = rt.userDirectory || {};
+    user = userDir[email];
+    if (!user) throw new Error(`User not found in routing table or DB: ${email}`);
+
+    const group = resolvePositionGroup(email, user.position, rt);
+    if (!group) throw new Error(`No position group found for ${email} (position: ${user.position}). Access denied.`);
+
+    const allowedPortals = group.portal || [];
+    if (allowedPortals.length > 0 && !allowedPortals.includes(String(portalId))) {
+      throw new Error(`Portal ${portalId} not authorized for ${email} (group: ${group._groupName}, allowed: ${allowedPortals.join(', ')})`);
+    }
+
+    const accessLevel = group.accessLevel || 'owner';
+    const canWrite = ['Dev_IT', 'Finance', 'Executive', 'CS_DeptLeads', 'Marketing_GroupLeaders',
+      'Sales_GroupLeaders', 'CS_TeamLeaders', 'Sales_Group', 'Marketing_Group'].includes(group._groupName);
+    const writeScope = ['Dev_IT', 'Finance', 'Executive'].includes(group._groupName) ? 'any' : 'owned';
+
+    identity = {
+      email, name: user.name, position: user.position, department: user.department,
+      branch: user.branch, agent: user.agent, positionGroup: group._groupName,
+      accessLevel, allowedPortals, allowedObjects: group.objects || [], topics: group.topics || [],
+      canWrite, writeScope, database: group.database || false,
+      ownerId: user.ownerId || null, hubspotTeams: user.hubspotTeams || [], primaryTeam: user.primaryTeam || null,
+      proxyEnabled: true, token: null,
+      _source: 'routing-table',
+    };
+    console.log(`[identity] Resolved ${email} from routing-table.json (fallback)`);
   }
 
-  const accessLevel = group.accessLevel || 'owner';
-  const canWrite = ['Dev_IT', 'Finance', 'Executive', 'CS_DeptLeads', 'Marketing_GroupLeaders',
-    'Sales_GroupLeaders', 'CS_TeamLeaders', 'Sales_Group', 'Marketing_Group'].includes(group._groupName);
-  const writeScope = ['Dev_IT', 'Finance', 'Executive'].includes(group._groupName) ? 'any' : 'owned';
+  // Resolve token (always)
+  try {
+    identity.token = await getToken(email, portalId);
+  } catch (err) {
+    console.error(`[identity] Token fetch failed for ${email}:`, err.message);
+  }
 
-  const token = await getToken(email, portalId);
-
-  let ownerId = user.ownerId || null;
-  let hubspotTeams = user.hubspotTeams || [];
-  let primaryTeam = user.primaryTeam || null;
-
-  if (!ownerId) {
+  // Resolve ownerId if missing
+  if (!identity.ownerId && identity.token) {
     try {
-      const ownerInfo = await resolveOwner(email, token);
-      if (ownerInfo) { ownerId = ownerInfo.ownerId; hubspotTeams = ownerInfo.teams; primaryTeam = ownerInfo.primaryTeam; }
+      const ownerInfo = await resolveOwner(email, identity.token);
+      if (ownerInfo) {
+        identity.ownerId = ownerInfo.ownerId;
+        identity.hubspotTeams = ownerInfo.teams;
+        identity.primaryTeam = ownerInfo.primaryTeam;
+      }
     } catch (err) {
-      console.error(`Failed to resolve HubSpot owner for ${email}:`, err.message);
+      console.error(`[identity] Owner resolution failed for ${email}:`, err.message);
     }
   }
-
-  const identity = {
-    email, name: user.name, position: user.position, department: user.department,
-    branch: user.branch, agent: user.agent, positionGroup: group._groupName,
-    accessLevel, allowedPortals, allowedObjects: group.objects || [], topics: group.topics || [],
-    canWrite, writeScope, database: group.database || false,
-    ownerId, hubspotTeams, primaryTeam, proxyEnabled: true, token,
-  };
 
   setCache(email, portalId, identity);
   return identity;
@@ -560,7 +623,7 @@ function deduplicateRecords(records) {
 
 app.post('/query/dynamic-list', async (req, res) => {
   try {
-    const { email, portal_id, campaign_name, icp_filters = {}, countOnly = false } = req.body;
+    const { email, portal_id, campaign_name, icp_filters = {}, countOnly = false, dry_run = false } = req.body;
 
     if (!email || !campaign_name) return res.status(400).json({ error: 'email and campaign_name are required' });
     if (!icp_filters.country?.length && !icp_filters.industry?.length && !icp_filters.job_title_keywords?.length) {
@@ -590,9 +653,12 @@ app.post('/query/dynamic-list', async (req, res) => {
     }
 
     const total = combined.length;
+
+    // countOnly — return counts only, no records
     if (countOnly) {
       return res.json({ total, tier1: t1.total || 0, tier2: t2.total || 0, tier3: tier3Used ? t3Total : null, tier3_used: tier3Used, after_dedup: total });
     }
+
     if (total > 500) {
       return res.json({ status: 'too_many', message: `Found ${total} records after deduplication — too broad.`, total, tier1: t1.total || 0, tier2: t2.total || 0, tier3_used: tier3Used, suggestion: 'Try narrowing by country, job title, or industry' });
     }
@@ -600,6 +666,35 @@ app.post('/query/dynamic-list', async (req, res) => {
     const finalRecords = combined.slice(0, 500);
     const today = new Date().toISOString().slice(0, 10);
     const listName = `${campaign_name} - Dynamic Pull - ${today}`;
+
+    // dry_run — return preview without creating list or stamping records
+    if (dry_run) {
+      auditLog({ email, accessLevel: identity.accessLevel, portal: portalId, object: '2-20106951', action: 'dynamic-list-dry-run', campaign_name, resultCount: finalRecords.length });
+      return res.json({
+        dry_run: true,
+        campaign_name,
+        list_name: listName,
+        caller: { email: identity.email, positionGroup: identity.positionGroup },
+        summary: {
+          total_pulled: finalRecords.length,
+          tier1_count: Math.min(t1.results?.length || 0, finalRecords.length),
+          tier2_count: Math.min(t2.results?.length || 0, finalRecords.length),
+          tier3_used: tier3Used,
+        },
+        records: finalRecords.map(r => ({
+          id: r.id,
+          email: r.properties?.email,
+          firstname: r.properties?.firstname,
+          lastname: r.properties?.lastname,
+          company: r.properties?.company,
+          job_title: r.properties?.job_title,
+          country: r.properties?.country,
+          industry: r.properties?.industry,
+          pipeline_stage: r.properties?.hs_pipeline_stage,
+          dynamic_list_target: r.properties?.dynamic_list_target,
+        })),
+      });
+    }
 
     const listResp = await axios.post(`${HUBSPOT_API}/crm/v3/lists`, { name: listName, objectTypeId: '2-20106951', processingType: 'MANUAL' }, { headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' } });
     const listId = listResp.data?.list?.listId;
@@ -632,6 +727,257 @@ app.post('/query/dynamic-list', async (req, res) => {
     });
   } catch (err) {
     console.error('Dynamic list failed:', err.message);
+    res.status(500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// --- Lead Qualification (FAINT) — MarketingCRM only ---
+
+const QUALIFY_PORTAL = '4950628'; // MarketingCRM
+
+// HubSpot object type IDs
+const HS_OBJECT_TYPE_MAP = {
+  '0-1': 'contact',
+  '0-2': 'company',
+  '0-3': 'deal',
+};
+
+function parseHubSpotUrl(url) {
+  if (!url) return null;
+  // Format 1: app.hubspot.com/contacts/<portal>/contact|deal|company/<id>
+  const m1 = url.match(/app(?:-[a-z0-9]+)?\.hubspot\.com\/contacts\/(\d+)\/(contact|deal|company)\/(\d+)/);
+  if (m1) return { portal_id: m1[1], type: m1[2], id: m1[3] };
+  // Format 2: app-na2.hubspot.com/contacts/<portal>/record/<typeId>/<id>
+  const m2 = url.match(/app(?:-[a-z0-9]+)?\.hubspot\.com\/contacts\/(\d+)\/record\/([0-9-]+)\/(\d+)/);
+  if (m2) {
+    const type = HS_OBJECT_TYPE_MAP[m2[2]] || null;
+    if (!type) return null;
+    return { portal_id: m2[1], type, id: m2[3] };
+  }
+  return null;
+}
+
+app.post('/qualify', async (req, res) => {
+  try {
+    let { email, contact_id, deal_id, url } = req.body;
+
+    // Parse from HubSpot URL if provided
+    if (url) {
+      const parsed = parseHubSpotUrl(url);
+      if (!parsed) return res.status(400).json({ error: 'Could not parse HubSpot URL. Expected format: https://app.hubspot.com/contacts/<portal>/contact/<id>' });
+      if (parsed.type === 'contact') contact_id = parsed.id;
+      else if (parsed.type === 'deal') deal_id = parsed.id;
+      else return res.status(400).json({ error: `Unsupported object type in URL: ${parsed.type}` });
+    }
+    if (!email) return res.status(400).json({ error: 'email is required' });
+    if (!contact_id && !deal_id) return res.status(400).json({ error: 'contact_id or deal_id is required' });
+
+    const identity = await resolveIdentity(email, QUALIFY_PORTAL);
+    const apiToken = ADMIN_TOKENS[QUALIFY_PORTAL] || identity.token;
+    if (!apiToken) return res.status(403).json({ error: 'No API token available for MarketingCRM' });
+
+    const headers = { Authorization: `Bearer ${apiToken}` };
+
+    // Fetch contact properties
+    const contactProps = [
+      'email','firstname','lastname','company','jobtitle','phone',
+      'country','state','industry','hs_lead_status','lifecyclestage',
+      'num_contacted_notes','notes_last_contacted','hs_email_last_open_date',
+      'hs_email_last_click_date','hs_last_sales_activity_date',
+      'hs_analytics_num_visits','hs_analytics_num_page_views',
+      'createdate','lastmodifieddate','hs_pipeline_stage'
+    ];
+
+    let contact = null;
+    let deals = [];
+    let activities = [];
+
+    if (contact_id) {
+      const cResp = await axios.get(
+        `${HUBSPOT_API}/crm/v3/objects/contacts/${contact_id}`,
+        { headers, params: { properties: contactProps.join(','), associations: 'deals' } }
+      );
+      contact = cResp.data;
+    }
+
+    if (deal_id) {
+      const dResp = await axios.get(
+        `${HUBSPOT_API}/crm/v3/objects/deals/${deal_id}`,
+        { headers, params: { properties: 'dealname,dealstage,amount,closedate,pipeline,hs_deal_stage_probability,description,hs_priority,createdate,notes_last_contacted,hs_last_sales_activity_date' } }
+      );
+      deals = [dResp.data];
+
+      // If no contact_id, try to get associated contact
+      if (!contact) {
+        try {
+          const assocResp = await axios.get(
+            `${HUBSPOT_API}/crm/v4/objects/deals/${deal_id}/associations/contacts`,
+            { headers }
+          );
+          const firstContact = assocResp.data?.results?.[0];
+          if (firstContact) {
+            const cResp = await axios.get(
+              `${HUBSPOT_API}/crm/v3/objects/contacts/${firstContact.toObjectId}`,
+              { headers, params: { properties: contactProps.join(',') } }
+            );
+            contact = cResp.data;
+          }
+        } catch (e) { /* no contact found */ }
+      }
+    } else if (contact?.associations?.deals?.results?.length) {
+      // Fetch deals from contact associations
+      const dealIds = contact.associations.deals.results.slice(0, 3).map(d => d.id);
+      const dealResps = await Promise.allSettled(dealIds.map(id =>
+        axios.get(`${HUBSPOT_API}/crm/v3/objects/deals/${id}`, {
+          headers,
+          params: { properties: 'dealname,dealstage,amount,closedate,pipeline,hs_deal_stage_probability,description,hs_priority,createdate,notes_last_contacted,hs_last_sales_activity_date' }
+        })
+      ));
+      deals = dealResps.filter(r => r.status === 'fulfilled').map(r => r.value.data);
+    }
+
+    // Fetch recent activities (engagements)
+    if (contact?.id) {
+      try {
+        const engResp = await axios.get(
+          `${HUBSPOT_API}/engagements/v1/engagements/associated/CONTACT/${contact.id}/paged`,
+          { headers, params: { limit: 20 } }
+        );
+        activities = engResp.data?.results || [];
+      } catch (e) { /* activities optional */ }
+    }
+
+    const cp = contact?.properties || {};
+    const dp = deals[0]?.properties || {};
+    const now = Date.now();
+
+    // --- FAINT Scoring ---
+    let scores = { fit: 0, interest: 0, authority: 0, need: 0, timeline: 0, competitor: 0 };
+    let reasoning = {};
+
+    // FIT (30pts max) — company/industry/role match
+    let fitScore = 0;
+    const fitNotes = [];
+    if (cp.industry) { fitScore += 8; fitNotes.push(`Industry: ${cp.industry}`); }
+    if (cp.jobtitle) {
+      const title = (cp.jobtitle || '').toLowerCase();
+      if (/director|vp|vice president|head|chief|cxo|ceo|coo|cfo|cto|ciso|svp|evp/.test(title)) { fitScore += 12; fitNotes.push(`Senior title: ${cp.jobtitle}`); }
+      else if (/manager|lead|senior|principal/.test(title)) { fitScore += 8; fitNotes.push(`Mid-level title: ${cp.jobtitle}`); }
+      else { fitScore += 4; fitNotes.push(`Title: ${cp.jobtitle}`); }
+    }
+    if (cp.company) { fitScore += 5; fitNotes.push(`Company: ${cp.company}`); }
+    if (cp.country === 'United States') { fitScore += 5; fitNotes.push('US-based'); }
+    scores.fit = Math.min(fitScore, 30);
+    reasoning.fit = fitNotes;
+
+    // INTEREST (20pts max) — engagement signals
+    let interestScore = 0;
+    const interestNotes = [];
+    const lastOpen = cp.hs_email_last_open_date ? new Date(cp.hs_email_last_open_date) : null;
+    const lastClick = cp.hs_email_last_click_date ? new Date(cp.hs_email_last_click_date) : null;
+    const lastActivity = cp.hs_last_sales_activity_date ? new Date(cp.hs_last_sales_activity_date) : null;
+    const pageViews = parseInt(cp.hs_analytics_num_page_views) || 0;
+    const visits = parseInt(cp.hs_analytics_num_visits) || 0;
+    if (lastClick) { interestScore += 8; interestNotes.push(`Last email click: ${lastClick.toISOString().slice(0,10)}`); }
+    else if (lastOpen) { interestScore += 4; interestNotes.push(`Last email open: ${lastOpen.toISOString().slice(0,10)}`); }
+    if (pageViews >= 5) { interestScore += 5; interestNotes.push(`${pageViews} page views`); }
+    else if (pageViews > 0) { interestScore += 2; interestNotes.push(`${pageViews} page views`); }
+    if (visits >= 3) { interestScore += 4; interestNotes.push(`${visits} site visits`); }
+    if (activities.length >= 3) { interestScore += 3; interestNotes.push(`${activities.length} logged activities`); }
+    scores.interest = Math.min(interestScore, 20);
+    reasoning.interest = interestNotes;
+
+    // AUTHORITY (15pts max) — decision-making level
+    let authScore = 0;
+    const authNotes = [];
+    const titleLow = (cp.jobtitle || '').toLowerCase();
+    if (/\b(ceo|coo|cfo|cto|ciso|chief|president|owner|founder|partner)\b/.test(titleLow)) { authScore = 15; authNotes.push('C-level / Owner'); }
+    else if (/\b(vp|vice president|svp|evp|director|head of)\b/.test(titleLow)) { authScore = 12; authNotes.push('VP / Director'); }
+    else if (/\b(manager|lead|senior|principal)\b/.test(titleLow)) { authScore = 8; authNotes.push('Manager / Lead'); }
+    else if (cp.jobtitle) { authScore = 4; authNotes.push('Individual contributor'); }
+    scores.authority = authScore;
+    reasoning.authority = authNotes;
+
+    // NEED (15pts max) — pipeline stage & deal signals
+    let needScore = 0;
+    const needNotes = [];
+    const stage = dp.dealstage || cp.hs_pipeline_stage || '';
+    const lifecycle = cp.lifecyclestage || '';
+    if (['closedwon','decisionmakerboughtin','contractsent','presentationscheduled'].some(s => stage.toLowerCase().includes(s))) { needScore = 15; needNotes.push(`Hot stage: ${stage}`); }
+    else if (['qualifiedtobuy','appointmentscheduled'].some(s => stage.toLowerCase().includes(s))) { needScore = 10; needNotes.push(`Qualified stage: ${stage}`); }
+    else if (lifecycle === 'opportunity' || lifecycle === 'salesqualifiedlead') { needScore = 8; needNotes.push(`Lifecycle: ${lifecycle}`); }
+    else if (lifecycle === 'marketingqualifiedlead') { needScore = 5; needNotes.push(`Lifecycle: ${lifecycle}`); }
+    else if (deals.length > 0) { needScore = 3; needNotes.push('Has open deal'); }
+    scores.need = needScore;
+    reasoning.need = needNotes;
+
+    // TIMELINE (10pts max) — recency / urgency
+    let timelineScore = 0;
+    const timelineNotes = [];
+    const lastContactedDate = dp.notes_last_contacted || cp.notes_last_contacted;
+    const daysSinceContact = lastContactedDate ? Math.floor((now - new Date(lastContactedDate)) / 86400000) : null;
+    const closeDate = dp.closedate ? new Date(dp.closedate) : null;
+    const daysToClose = closeDate ? Math.floor((closeDate - now) / 86400000) : null;
+    if (daysToClose !== null && daysToClose >= 0 && daysToClose <= 30) { timelineScore += 6; timelineNotes.push(`Close date in ${daysToClose} days`); }
+    else if (daysToClose !== null && daysToClose <= 90) { timelineScore += 3; timelineNotes.push(`Close date in ${daysToClose} days`); }
+    if (daysSinceContact !== null && daysSinceContact <= 7) { timelineScore += 4; timelineNotes.push(`Contacted ${daysSinceContact}d ago`); }
+    else if (daysSinceContact !== null && daysSinceContact <= 30) { timelineScore += 2; timelineNotes.push(`Contacted ${daysSinceContact}d ago`); }
+    else if (daysSinceContact !== null && daysSinceContact > 60) { timelineScore -= 3; timelineNotes.push(`Stalled ${daysSinceContact}d since last contact`); }
+    scores.timeline = Math.max(0, Math.min(timelineScore, 10));
+    reasoning.timeline = timelineNotes;
+
+    // COMPETITOR (10pts max) — no direct signal, base on deal priority/amount
+    let compScore = 5; // default neutral
+    const compNotes = ['No competitor data in HubSpot — defaulting to neutral'];
+    const amount = parseFloat(dp.amount) || 0;
+    if (dp.hs_priority === 'high') { compScore = 8; compNotes.push('Deal priority: high'); }
+    else if (dp.hs_priority === 'medium') { compScore = 6; compNotes.push('Deal priority: medium'); }
+    if (amount > 50000) { compScore = Math.min(compScore + 2, 10); compNotes.push(`Deal amount: $${amount.toLocaleString()}`); }
+    scores.competitor = compScore;
+    reasoning.competitor = compNotes;
+
+    const total = Object.values(scores).reduce((a, b) => a + b, 0);
+    const maxScore = 100;
+    const normalizedTotal = Math.round((total / maxScore) * 100);
+    let tier, action;
+    if (normalizedTotal >= 80) { tier = 'Hot'; action = 'Call today'; }
+    else if (normalizedTotal >= 60) { tier = 'Warm'; action = 'Call this week'; }
+    else { tier = 'Nurture/Disqualify'; action = 'Add to nurture sequence or disqualify'; }
+
+    auditLog({ email, accessLevel: identity.accessLevel, portal: QUALIFY_PORTAL, action: 'qualify', contact_id: contact?.id, deal_id: deal_id, score: normalizedTotal, tier });
+
+    res.json({
+      score: normalizedTotal,
+      tier,
+      action,
+      contact: {
+        id: contact?.id,
+        name: `${cp.firstname || ''} ${cp.lastname || ''}`.trim(),
+        email: cp.email,
+        company: cp.company,
+        title: cp.jobtitle,
+        lifecycle: cp.lifecyclestage,
+      },
+      deal: deals[0] ? {
+        id: deals[0].id,
+        name: dp.dealname,
+        stage: dp.dealstage,
+        amount: dp.amount,
+        close_date: dp.closedate,
+      } : null,
+      breakdown: {
+        fit:        { score: scores.fit,        max: 30, weight: '30%', notes: reasoning.fit },
+        interest:   { score: scores.interest,   max: 20, weight: '20%', notes: reasoning.interest },
+        authority:  { score: scores.authority,  max: 15, weight: '15%', notes: reasoning.authority },
+        need:       { score: scores.need,       max: 15, weight: '15%', notes: reasoning.need },
+        timeline:   { score: scores.timeline,   max: 10, weight: '10%', notes: reasoning.timeline },
+        competitor: { score: scores.competitor, max: 10, weight: '10%', notes: reasoning.competitor },
+      },
+      portal: 'MarketingCRM',
+      caller: { email: identity.email, positionGroup: identity.positionGroup },
+    });
+  } catch (err) {
+    console.error('[qualify] Error:', err.message);
     res.status(500).json({ error: err.response?.data || err.message });
   }
 });

@@ -56,62 +56,71 @@ async function loadRedirectUriFromDb() {
 
 const ORG_ID = 'f86d92cb-db10-43ff-9ff2-d69c319d272d';
 
+async function dbQuery(sql, params = []) {
+  const pg = new Client({ connectionString: DB_URL });
+  await pg.connect();
+  try { return await pg.query(sql, params); }
+  finally { await pg.end().catch(() => {}); }
+}
+
 async function saveRefreshToken(email, token, scopes = [], meta = {}) {
   try {
-    await withPg(async (pg) => {
-      const acct = await pg.query(
-        `SELECT id FROM fleet.accounts WHERE email=$1 AND org_id=$2`,
-        [email, ORG_ID]
-      );
-      if (!acct.rows.length) throw new Error(`Account not found for ${email}`);
-      const account_id = acct.rows[0].id;
-      await pg.query(`
-        INSERT INTO fleet.user_integrations
-          (org_id, account_id, integration, portal_id, enabled, scopes, credentials, meta)
-        VALUES ($1,$2,'google',NULL,true,$3,$4,$5)
-        ON CONFLICT (org_id, account_id, integration, portal_id) DO UPDATE SET
-          credentials = EXCLUDED.credentials,
-          scopes      = CASE WHEN array_length(EXCLUDED.scopes,1) > 0 THEN EXCLUDED.scopes ELSE fleet.user_integrations.scopes END,
-          meta        = CASE WHEN EXCLUDED.meta != '{}'::jsonb THEN EXCLUDED.meta ELSE fleet.user_integrations.meta END,
-          updated_at  = now()
-      `, [ORG_ID, account_id, scopes, JSON.stringify({ refresh_token: token, issued_at: Date.now() }), JSON.stringify({ email, ...meta })]);
-    });
+    const acct = await dbQuery(`SELECT id FROM fleet.accounts WHERE email=$1 AND org_id=$2`, [email, ORG_ID]);
+    if (!acct.rows.length) throw new Error(`Account not found for ${email}`);
+    const account_id = acct.rows[0].id;
+    const scopeArr = Array.isArray(scopes) ? scopes : [];
+
+    // Resolve access_level from account role
+    const roleRow = await dbQuery(`SELECT role FROM fleet.accounts WHERE id=$1`, [account_id]);
+    const accountRole = roleRow.rows[0]?.role || 'agent';
+    const accessLevel = accountRole === 'admin' ? 'admin' : accountRole === 'team_lead' ? 'team' : 'standard';
+
+    // Google tokens don't expire (refresh tokens are long-lived) — set far future
+    const expiresAt = new Date(Date.now() + 180 * 24 * 60 * 60 * 1000).toISOString();
+
+    await dbQuery(`
+      INSERT INTO fleet.user_integrations
+        (org_id, account_id, integration, portal_id, enabled, access_level, scopes, credentials, meta, last_used_at, expires_at)
+      VALUES ($1,$2,'google',NULL,true,$3,$4,$5,$6,now(),$7)
+      ON CONFLICT (org_id, account_id, integration, portal_id) DO UPDATE SET
+        credentials  = EXCLUDED.credentials,
+        scopes       = CASE WHEN array_length(EXCLUDED.scopes,1) > 0 THEN EXCLUDED.scopes ELSE fleet.user_integrations.scopes END,
+        meta         = CASE WHEN EXCLUDED.meta != '{}'::jsonb THEN EXCLUDED.meta ELSE fleet.user_integrations.meta END,
+        access_level = EXCLUDED.access_level,
+        enabled      = true,
+        last_used_at = now(),
+        expires_at   = EXCLUDED.expires_at,
+        updated_at   = now()
+    `, [ORG_ID, account_id, accessLevel, scopeArr, JSON.stringify({ refresh_token: token, issued_at: Date.now() }), JSON.stringify({ email, ...meta }), expiresAt]);
     console.log(`[google-auth] Refresh token saved to DB for ${email}`);
   } catch (err) {
     console.error(`[google-auth] DB save failed, falling back to file: ${err.message}`);
-    fs.mkdirSync(TOKEN_DIR, { recursive: true });
-    fs.writeFileSync(path.join(TOKEN_DIR, `${email}.token`), token, 'utf8');
+    try { fs.mkdirSync(TOKEN_DIR, { recursive: true }); fs.writeFileSync(path.join(TOKEN_DIR, `${email}.token`), token, 'utf8'); } catch {}
   }
 }
 
 async function loadRefreshToken(email) {
   try {
-    const result = await withPg(async (pg) => {
-      return pg.query(
-        `SELECT ui.credentials FROM fleet.user_integrations ui
-         JOIN fleet.accounts a ON a.id = ui.account_id
-         WHERE a.email=$1 AND ui.integration='google' AND ui.enabled=true AND ui.org_id=$2`,
-        [email, ORG_ID]
-      );
-    });
+    const result = await dbQuery(
+      `SELECT ui.credentials FROM fleet.user_integrations ui
+       JOIN fleet.accounts a ON a.id = ui.account_id
+       WHERE a.email=$1 AND ui.integration='google' AND ui.enabled=true AND ui.org_id=$2`,
+      [email, ORG_ID]
+    );
     if (result.rows.length) {
       const creds = result.rows[0].credentials;
-      const token = creds.refresh_token || creds.token || null;
-      if (token) {
-        // Auto-migrate file token if DB found it
-        return token;
-      }
+      return creds.refresh_token || creds.token || null;
     }
   } catch (err) {
     console.error(`[google-auth] DB load failed, falling back to file: ${err.message}`);
   }
-  // File fallback — migrate to DB on next save
+  // File fallback — auto-migrate to DB
   try {
     const token = fs.readFileSync(path.join(TOKEN_DIR, `${email}.token`), 'utf8').trim();
     if (token) {
       console.log(`[google-auth] Migrating file token to DB for ${email}`);
       await saveRefreshToken(email, token);
-      fs.unlinkSync(path.join(TOKEN_DIR, `${email}.token`));
+      try { fs.unlinkSync(path.join(TOKEN_DIR, `${email}.token`)); } catch {}
     }
     return token || null;
   } catch { return null; }
@@ -119,14 +128,12 @@ async function loadRefreshToken(email) {
 
 async function deleteRefreshToken(email) {
   try {
-    await withPg(async (pg) => {
-      await pg.query(
-        `UPDATE fleet.user_integrations ui SET enabled=false, updated_at=now()
-         FROM fleet.accounts a
-         WHERE a.id=ui.account_id AND a.email=$1 AND ui.integration='google' AND ui.org_id=$2`,
-        [email, ORG_ID]
-      );
-    });
+    await dbQuery(
+      `UPDATE fleet.user_integrations ui SET enabled=false, updated_at=now()
+       FROM fleet.accounts a
+       WHERE a.id=ui.account_id AND a.email=$1 AND ui.integration='google' AND ui.org_id=$2`,
+      [email, ORG_ID]
+    );
     console.log(`[google-auth] Token disabled in DB for ${email}`);
   } catch (err) {
     console.error(`[google-auth] DB delete failed: ${err.message}`);
@@ -157,7 +164,7 @@ function destroySession(email, { revokeToken = false } = {}) {
   const s = sessions.get(email);
   if (s?._idleTimer) clearTimeout(s._idleTimer);
   sessions.delete(email);
-  if (revokeToken) deleteRefreshToken(email);
+  if (revokeToken) deleteRefreshToken(email).catch(() => {});
   console.log(`[google-auth] Session destroyed: ${email}`);
 }
 
@@ -285,9 +292,8 @@ const server = http.createServer(async (req, res) => {
       if (email) {
         let s = getSession(email);
         if (!s) {
-          const saved = loadRefreshToken(email);
+          const saved = await loadRefreshToken(email);
           if (saved) {
-            // Restore from file
             const stub = { email, refresh_token: saved, access_token: null, expires_at: 0 };
             sessions.set(email, stub);
             s = stub;
@@ -327,7 +333,7 @@ const server = http.createServer(async (req, res) => {
     if (!email) return json(400, { error: 'email required' });
     let s = getSession(email);
     if (!s) {
-      const saved = loadRefreshToken(email);
+      const saved = await loadRefreshToken(email);
       if (!saved) return json(404, { error: 'No session for ' + email + ' — auth required.' });
       try {
         const stub = { email, refresh_token: saved, access_token: null, expires_at: 0, _idleTimer: null };
@@ -404,7 +410,7 @@ const server = http.createServer(async (req, res) => {
         scopes: pending.scopes, created_at: Date.now(), last_used: Date.now(), _idleTimer: null,
       };
       sessions.set(email, session);
-      if (tokenData.refresh_token) saveRefreshToken(email, tokenData.refresh_token);
+      if (tokenData.refresh_token) saveRefreshToken(email, tokenData.refresh_token, pending.scopes || []).catch(console.error);
       touchSession(email);
 
       completedCallbacks.set(state, { email, ts: Date.now() });
@@ -434,7 +440,7 @@ p{font-size:13px;color:#64748b;line-height:1.6;}
   async function getAccessToken(email) {
     let s = getSession(email);
     if (!s) {
-      const saved = loadRefreshToken(email);
+      const saved = await loadRefreshToken(email);
       if (!saved) throw { status: 401, reason: 'auth_required', message: `No session for ${email} — auth required.` };
       const stub = { email, refresh_token: saved, access_token: null, expires_at: 0, _idleTimer: null };
       sessions.set(email, stub);

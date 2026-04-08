@@ -42,10 +42,16 @@ const pendingAuths = new Map();
 const SESSION_IDLE_MS          = 60 * 60 * 1000;
 const REFRESH_TOKEN_MAX_AGE_MS = 25 * 24 * 60 * 60 * 1000;
 
-const REQUIRED_SCOPES         = 'oauth crm.objects.contacts.read crm.objects.deals.read crm.objects.companies.read crm.objects.owners.read crm.objects.custom.read crm.lists.read';
-const DEFAULT_OPTIONAL_SCOPES = [];
-const PORTAL_SCOPE_PRESETS    = { '4950628': [], '21203560': [] };
-const ROLE_SCOPE_ADDITIONS    = { 'org': [], 'team': [], 'owner': [] };
+const BASE_SCOPES_LIST = [
+  'oauth',
+  'crm.objects.contacts.read',
+  'crm.objects.deals.read',
+  'crm.objects.companies.read',
+  'crm.objects.owners.read',
+  'crm.objects.custom.read',
+  'crm.lists.read',
+];
+const REQUIRED_SCOPES = BASE_SCOPES_LIST.join(' ');
 
 // ─── Credentials ──────────────────────────────────────────────────────────────
 
@@ -55,6 +61,7 @@ function getClientSecret() { return process.env.HUBSPOT_CLIENT_SECRET; }
 // ─── Token storage — DB-first, file fallback ──────────────────────────────────
 
 const { Pool } = require('pg');
+const { resolveHubSpotScopes } = require('./pipeline');
 const dbPool = new Pool({ connectionString: process.env.DATABASE_URL || 'postgresql://postgres:fleetdev@127.0.0.1:5433/fleet_dev' });
 
 function keychainTokenKey(email, hubId) {
@@ -70,15 +77,28 @@ async function saveRefreshToken(email, hubId, refreshToken, extra = {}) {
     const account_id = acct.rows[0].id;
     const scopes = extra.scopes || [];
     const credentials = JSON.stringify({ refresh_token: refreshToken, issued_at: Date.now(), hub_id: hubId });
-    const meta = JSON.stringify({ hub_id: hubId, portal_name: KNOWN_PORTALS[hubId] || `Portal ${hubId}`, owner_id: extra.owner_id || null, user_id: extra.user_id || null, email });
+    const meta = JSON.stringify({ hub_id: hubId, portal_name: KNOWN_PORTALS[hubId] || `Portal ${hubId}`, owner_id: extra.owner_id || null, user_id: extra.user_id || null, position: extra.position || null, roles: extra.roles || [], email });
+    // Resolve access_level from account role
+    const roleRow = await dbPool.query(`SELECT role, department FROM fleet.accounts WHERE id=$1`, [account_id]);
+    const accountRole = roleRow.rows[0]?.role || 'agent';
+    const accessLevel = accountRole === 'admin' ? 'admin' : accountRole === 'team_lead' ? 'team' : 'standard';
+
+    // expires_at = 25 days from now (HubSpot refresh token lifetime)
+    const expiresAt = new Date(Date.now() + 25 * 24 * 60 * 60 * 1000).toISOString();
+
     await dbPool.query(`
-      INSERT INTO fleet.user_integrations (org_id, account_id, integration, portal_id, enabled, scopes, credentials, meta)
-      VALUES ($1,$2,'hubspot',$3,true,$4,$5,$6)
+      INSERT INTO fleet.user_integrations (org_id, account_id, integration, portal_id, enabled, access_level, scopes, credentials, meta, last_used_at, expires_at)
+      VALUES ($1,$2,'hubspot',$3,true,$4,$5,$6,$7,now(),$8)
       ON CONFLICT (org_id, account_id, integration, portal_id) DO UPDATE SET
-        credentials=EXCLUDED.credentials,
-        scopes=CASE WHEN array_length(EXCLUDED.scopes,1)>0 THEN EXCLUDED.scopes ELSE fleet.user_integrations.scopes END,
-        meta=EXCLUDED.meta, enabled=true, updated_at=now()
-    `, [ORG_ID, account_id, String(hubId), scopes, credentials, meta]);
+        credentials  = EXCLUDED.credentials,
+        scopes       = CASE WHEN array_length(EXCLUDED.scopes,1)>0 THEN EXCLUDED.scopes ELSE fleet.user_integrations.scopes END,
+        meta         = EXCLUDED.meta,
+        access_level = EXCLUDED.access_level,
+        enabled      = true,
+        last_used_at = now(),
+        expires_at   = EXCLUDED.expires_at,
+        updated_at   = now()
+    `, [ORG_ID, account_id, String(hubId), accessLevel, scopes, credentials, meta, expiresAt]);
     console.log(`[hubspot-oauth] Refresh token saved to DB for ${email} (portal: ${hubId})`);
   } catch (err) {
     console.error(`[hubspot-oauth] DB save failed, falling back to file: ${err.message}`);
@@ -156,6 +176,12 @@ function sessionKey(email, hubId) {
 // ─── Session management ───────────────────────────────────────────────────────
 
 function touchSession(email, hubId) {
+  // Update last_used_at in DB async (fire and forget)
+  dbPool.query(
+    `UPDATE fleet.user_integrations ui SET last_used_at=now()
+     FROM fleet.accounts a WHERE a.id=ui.account_id AND a.email=$1 AND ui.integration='hubspot' AND ui.portal_id=$2 AND ui.org_id=$3`,
+    [email, String(hubId), ORG_ID]
+  ).catch(() => {});
   const key = sessionKey(email, hubId);
   const s = sessions.get(key);
   if (!s) return;
@@ -375,29 +401,27 @@ async function handler(req, res) {
   if (req.method === 'POST' && path === '/auth/request') {
     let body = '';
     req.on('data', c => body += c);
-    req.on('end', () => {
+    req.on('end', async () => {
       try {
-        const { timeout_ms = 120000, portal_id, scopes, role } = JSON.parse(body || '{}');
+        const { timeout_ms = 120000, portal_id, email } = JSON.parse(body || '{}');
         const state    = crypto.randomBytes(16).toString('hex');
         const clientId = getClientId();
 
-        let optionalScopes;
-        if (Array.isArray(scopes) && scopes.length > 0) {
-          optionalScopes = scopes;
-        } else if (portal_id && PORTAL_SCOPE_PRESETS[String(portal_id)]) {
-          optionalScopes = [...PORTAL_SCOPE_PRESETS[String(portal_id)]];
-        } else {
-          optionalScopes = [...DEFAULT_OPTIONAL_SCOPES];
-        }
-        if (role && ROLE_SCOPE_ADDITIONS[role]) {
-          optionalScopes = [...new Set([...optionalScopes, ...ROLE_SCOPE_ADDITIONS[role]])];
-        }
+        // Resolve scopes from pipeline API based on employee position + roles
+        const resolved = email
+          ? await resolveHubSpotScopes(email)
+          : { scopes: BASE_SCOPES_LIST };
+
+        // Split into required (base) and optional (additional write scopes)
+        const baseSet      = new Set(BASE_SCOPES_LIST);
+        const requiredStr  = BASE_SCOPES_LIST.join(' ');
+        const optionalArr  = resolved.scopes.filter(s => !baseSet.has(s));
 
         const authUrl = `${HS_AUTH_URL}?` + new URLSearchParams({
           client_id:      clientId,
           redirect_uri:   REDIRECT_URI,
-          scope:          REQUIRED_SCOPES,
-          optional_scope: optionalScopes.join(' '),
+          scope:          requiredStr,
+          optional_scope: optionalArr.join(' '),
           state,
         }).toString();
 
@@ -407,7 +431,11 @@ async function handler(req, res) {
         }, timeout_ms);
 
         pendingAuths.set(state, {
-          portal_id: portal_id ? String(portal_id) : null,
+          portal_id:    portal_id ? String(portal_id) : null,
+          email:        email || null,
+          resolved_scopes: resolved.scopes,
+          position:     resolved.position || null,
+          roles:        resolved.roles || [],
           resolve: (result) => {
             clearTimeout(timer);
             pendingAuths.delete(state);
@@ -417,7 +445,7 @@ async function handler(req, res) {
         });
 
         res.writeHead(200);
-        res.end(JSON.stringify({ auth_url: authUrl, state, portal_id: portal_id || null }));
+        res.end(JSON.stringify({ auth_url: authUrl, state, portal_id: portal_id || null, scopes: resolved.scopes, position: resolved.position }));
       } catch (err) {
         res.writeHead(500);
         res.end(JSON.stringify({ error: err.message }));
@@ -496,7 +524,13 @@ async function handler(req, res) {
       sessions.set(sessionKey(email, hubId), session);
       touchSession(email, hubId);
 
-      if (tokens.refresh_token) saveRefreshToken(email, hubId, tokens.refresh_token);
+      if (tokens.refresh_token) await saveRefreshToken(email, hubId, tokens.refresh_token, {
+        scopes:   grantedScopes,
+        owner_id: ownerId,
+        user_id:  userId,
+        position: pending?.position || null,
+        roles:    pending?.roles || [],
+      });
 
       console.log(`[hubspot-oauth] Authenticated: ${email} (hub: ${hubId} — ${portalName}, owner: ${ownerId})`);
 

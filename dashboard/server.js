@@ -582,19 +582,96 @@ app.post('/api/accounts/:id/generate-otp', async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/bindings — with OTP status
+// GET /api/bindings — full user-bot mapping with filters
 app.get('/api/bindings', async (req, res) => {
   try {
-    const result = await pgPool.query(`
-      SELECT tb.telegram_id, tb.telegram_username, tb.telegram_name, tb.bound_at, tb.last_seen_at,
-             a.email, a.name, a.role, a.department, a.permissions
-      FROM fleet.telegram_bindings tb
-      JOIN fleet.accounts a ON a.id = tb.account_id
-      ORDER BY tb.bound_at DESC
-    `);
-    res.json(result.rows);
+    const { department, agent, status } = req.query;
+
+    // All accounts with their bindings (LEFT JOIN to include unbound)
+    let query = `
+      SELECT
+        a.id as account_id,
+        a.name, a.email, a.role, a.department, a.is_active,
+        tb.id as binding_id,
+        tb.telegram_id, tb.telegram_username, tb.telegram_name,
+        tb.bound_at, tb.last_seen_at, tb.agent_id,
+        ag.name as agent_name, ag.slug as agent_slug
+      FROM fleet.accounts a
+      LEFT JOIN fleet.telegram_bindings tb ON tb.account_id = a.id AND tb.org_id = $1
+      LEFT JOIN fleet.agents ag ON ag.id = tb.agent_id
+      WHERE a.org_id = $1
+    `;
+    const params = [ORG_ID];
+
+    if (department) { query += ` AND a.department = $${params.push(department)}`; }
+    if (agent) { query += ` AND ag.slug = $${params.push(agent)}`; }
+    if (status === 'paired') { query += ` AND tb.id IS NOT NULL`; }
+    if (status === 'unpaired') { query += ` AND tb.id IS NULL`; }
+
+    query += ` ORDER BY a.name, ag.name`;
+
+    const result = await pgPool.query(query, params);
+
+    // Group by account (one account can have multiple bindings)
+    const accountMap = {};
+    for (const row of result.rows) {
+      if (!accountMap[row.account_id]) {
+        accountMap[row.account_id] = {
+          id: row.account_id,
+          name: row.name,
+          email: row.email,
+          role: row.role,
+          department: row.department,
+          is_active: row.is_active,
+          bindings: []
+        };
+      }
+      if (row.binding_id) {
+        accountMap[row.account_id].bindings.push({
+          id: row.binding_id,
+          telegram_id: row.telegram_id,
+          telegram_username: row.telegram_username,
+          telegram_name: row.telegram_name,
+          bound_at: row.bound_at,
+          last_seen_at: row.last_seen_at,
+          agent_id: row.agent_id,
+          agent_name: row.agent_name,
+          agent_slug: row.agent_slug
+        });
+      }
+    }
+
+    res.json(Object.values(accountMap));
   } catch (err) {
     res.status(500).json({ error: 'Database error', detail: err.message });
+  }
+});
+
+// POST /api/bindings/assign — manually bind a user to a bot
+app.post('/api/bindings/assign', async (req, res) => {
+  try {
+    const { account_id, telegram_id, telegram_name, agent_id } = req.body;
+    if (!account_id || !telegram_id || !agent_id) return res.status(400).json({ error: 'account_id, telegram_id, agent_id required' });
+
+    await pgPool.query(`
+      INSERT INTO fleet.telegram_bindings (org_id, telegram_id, telegram_name, account_id, agent_id, bound_at)
+      VALUES ($1, $2, $3, $4, $5, now())
+      ON CONFLICT (telegram_id, org_id, agent_id) DO UPDATE SET telegram_name = EXCLUDED.telegram_name, bound_at = now()
+    `, [ORG_ID, telegram_id, telegram_name || null, account_id, agent_id]);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// DELETE /api/bindings/:id — unbind
+app.delete('/api/bindings/:id', async (req, res) => {
+  try {
+    await pgPool.query(`DELETE FROM fleet.telegram_bindings WHERE id = $1 AND org_id = $2`, [req.params.id, ORG_ID]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 

@@ -951,91 +951,266 @@ const Accounts = {
 
 const Bindings = {
   setup() {
-    const otpList = Vue.ref([]);
-    const loadOtp = async () => {
-      const r = await fetch('/api/otp-status');
-      otpList.value = await r.json();
-    };
-    Vue.onMounted(loadOtp);
-    setInterval(loadOtp, 10000);
+    const { ref, reactive, computed, onMounted } = Vue;
 
-    const otpBadge = (s) => ({
-      pending:   'bg-yellow-500/20 text-yellow-300 border-yellow-700',
-      completed: 'bg-green-500/20 text-green-300 border-green-700',
-      expired:   'bg-gray-700 text-gray-400 border-gray-600',
-      denied:    'bg-red-500/20 text-red-300 border-red-700',
-    }[s] || 'bg-gray-700 text-gray-400 border-gray-600');
+    const users = ref([]);
+    const allAgents = ref([]);
+    const loading = ref(false);
+    const filterDept = ref('');
+    const filterAgent = ref('');
+    const filterStatus = ref('');
 
-    return { bindings: computed(() => state.bindings), otpList, otpBadge, fmtDate, fmtRel };
+    const departments = computed(() => {
+      const deps = new Set(users.value.map(u => u.department).filter(Boolean));
+      return [...deps].sort();
+    });
+
+    const filtered = computed(() => {
+      return users.value.filter(u => {
+        if (filterDept.value && u.department !== filterDept.value) return false;
+        if (filterAgent.value && !u.bindings.some(b => b.agent_slug === filterAgent.value)) return false;
+        if (filterStatus.value === 'paired' && !u.bindings.length) return false;
+        if (filterStatus.value === 'unpaired' && u.bindings.length) return false;
+        return true;
+      });
+    });
+
+    const stats = computed(() => {
+      const total = filtered.value.length;
+      const paired = filtered.value.filter(u => u.bindings.length > 0).length;
+      return { total, paired, unpaired: total - paired };
+    });
+
+    async function loadBindings() {
+      loading.value = true;
+      try {
+        const r = await fetch('/api/bindings');
+        users.value = await r.json();
+      } catch {} finally { loading.value = false; }
+    }
+
+    onMounted(async () => {
+      await loadBindings();
+      try {
+        const r = await fetch('/api/agents');
+        allAgents.value = await r.json();
+      } catch {}
+    });
+
+    const roleBadge = (r) => ({ admin: 'bg-red-900/40 text-red-300 border-red-800', team_lead: 'bg-yellow-900/40 text-yellow-300 border-yellow-800', agent: 'bg-gray-700 text-gray-300 border-gray-600' }[r] || 'bg-gray-700 text-gray-300');
+
+    // Assign modal
+    const modal = reactive({
+      open: false,
+      account_id: '',
+      telegram_id: '',
+      telegram_name: '',
+      agent_id: '',
+      saving: false,
+      error: ''
+    });
+
+    function openAssign() {
+      modal.open = true;
+      modal.account_id = '';
+      modal.telegram_id = '';
+      modal.telegram_name = '';
+      modal.agent_id = '';
+      modal.saving = false;
+      modal.error = '';
+    }
+
+    async function submitAssign() {
+      if (!modal.account_id || !modal.telegram_id || !modal.agent_id) {
+        modal.error = 'Account, Telegram ID and Bot are required';
+        return;
+      }
+      modal.saving = true;
+      modal.error = '';
+      try {
+        const r = await fetch('/api/bindings/assign', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            account_id: modal.account_id,
+            telegram_id: modal.telegram_id,
+            telegram_name: modal.telegram_name || null,
+            agent_id: modal.agent_id
+          })
+        });
+        const d = await r.json();
+        if (d.success) {
+          modal.open = false;
+          await loadBindings();
+        } else {
+          modal.error = d.error || 'Failed';
+        }
+      } catch(e) { modal.error = e.message; }
+      modal.saving = false;
+    }
+
+    async function unbind(bindingId) {
+      if (!confirm('Remove this Telegram binding?')) return;
+      try {
+        await fetch(`/api/bindings/${bindingId}`, { method: 'DELETE' });
+        await loadBindings();
+      } catch {}
+    }
+
+    return { users, filtered, allAgents, loading, filterDept, filterAgent, filterStatus,
+             departments, stats, roleBadge, modal, openAssign, submitAssign, unbind,
+             fmtDate, fmtRel };
   },
   template: `
-    <div class="p-6 space-y-8">
-      <!-- Paired Users -->
-      <div>
-        <h1 class="text-xl font-bold mb-4 text-white">Paired Users</h1>
-        <div class="overflow-x-auto">
-          <table class="w-full text-xs">
-            <thead>
-              <tr class="text-gray-500 border-b border-gray-800">
-                <th class="text-left py-2 pr-4 font-medium">Telegram Name</th>
-                <th class="text-left py-2 pr-4 font-medium">Email</th>
-                <th class="text-left py-2 pr-4 font-medium">Role</th>
-                <th class="text-left py-2 pr-4 font-medium">Department</th>
-                <th class="text-left py-2 pr-4 font-medium">Bound At</th>
-                <th class="text-left py-2 font-medium">Last Seen</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="b in bindings" :key="b.telegram_id" class="border-b border-gray-800/50 hover:bg-gray-800/30">
-                <td class="py-2 pr-4 text-gray-200">{{ b.telegram_name || b.telegram_username || b.telegram_id }}</td>
-                <td class="py-2 pr-4 text-blue-400">{{ b.email }}</td>
-                <td class="py-2 pr-4"><span class="px-2 py-0.5 rounded bg-indigo-900/40 text-indigo-300 border border-indigo-700">{{ b.role }}</span></td>
-                <td class="py-2 pr-4 text-gray-400">{{ b.department || '—' }}</td>
-                <td class="py-2 pr-4 text-gray-500 whitespace-nowrap">{{ fmtDate(b.bound_at) }}</td>
-                <td class="py-2 text-gray-500 whitespace-nowrap">{{ fmtRel(b.last_seen_at) }}</td>
-              </tr>
-              <tr v-if="!bindings.length"><td colspan="6" class="py-8 text-center text-gray-600">No paired users yet</td></tr>
-            </tbody>
-          </table>
+    <div class="p-6 space-y-6">
+      <!-- Header -->
+      <div class="flex items-center justify-between">
+        <h1 class="text-xl font-bold text-white">Bindings <span class="text-gray-600 text-sm font-normal">({{ stats.total }})</span></h1>
+        <button @click="openAssign" class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors">＋ Assign</button>
+      </div>
+
+      <!-- Stats -->
+      <div class="grid grid-cols-3 gap-3">
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+          <div class="text-2xl font-bold text-white">{{ stats.total }}</div>
+          <div class="text-gray-500 text-xs mt-0.5">Total Users</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+          <div class="text-2xl font-bold text-green-400">{{ stats.paired }}</div>
+          <div class="text-gray-500 text-xs mt-0.5">Paired</div>
+        </div>
+        <div class="bg-gray-900 border border-gray-800 rounded-xl p-4 text-center">
+          <div class="text-2xl font-bold text-gray-500">{{ stats.unpaired }}</div>
+          <div class="text-gray-500 text-xs mt-0.5">Unpaired</div>
         </div>
       </div>
 
-      <!-- OTP Verifications -->
-      <div>
-        <h2 class="text-base font-semibold mb-3 text-white flex items-center gap-2">
-          OTP Verifications
-          <span class="text-xs text-gray-500 font-normal">(auto-refreshes every 10s)</span>
-        </h2>
-        <div class="overflow-x-auto">
-          <table class="w-full text-xs">
-            <thead>
-              <tr class="text-gray-500 border-b border-gray-800">
-                <th class="text-left py-2 pr-4 font-medium">Telegram ID</th>
-                <th class="text-left py-2 pr-4 font-medium">Email</th>
-                <th class="text-left py-2 pr-4 font-medium">Name</th>
-                <th class="text-left py-2 pr-4 font-medium">OTP</th>
-                <th class="text-left py-2 pr-4 font-medium">Attempts</th>
-                <th class="text-left py-2 pr-4 font-medium">Status</th>
-                <th class="text-left py-2 pr-4 font-medium">Expires</th>
-                <th class="text-left py-2 font-medium">Requested</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="o in otpList" :key="o.id" class="border-b border-gray-800/50 hover:bg-gray-800/30">
-                <td class="py-2 pr-4 text-gray-400 font-mono">{{ o.telegram_id }}</td>
-                <td class="py-2 pr-4 text-blue-400">{{ o.email }}</td>
-                <td class="py-2 pr-4 text-gray-300">{{ o.account_name || '—' }}</td>
-                <td class="py-2 pr-4 font-mono text-yellow-300 tracking-widest">{{ o.status === 'pending' ? o.otp_code : '••••••' }}</td>
-                <td class="py-2 pr-4 text-center text-gray-400">{{ o.attempts }}/3</td>
-                <td class="py-2 pr-4">
-                  <span :class="otpBadge(o.status)" class="px-2 py-0.5 rounded-full border text-xs">{{ o.status }}</span>
-                </td>
-                <td class="py-2 pr-4 text-gray-500 whitespace-nowrap" :class="o.status==='pending' ? 'text-yellow-400' : ''">{{ fmtRel(o.expires_at) }}</td>
-                <td class="py-2 text-gray-500 whitespace-nowrap">{{ fmtRel(o.created_at) }}</td>
-              </tr>
-              <tr v-if="!otpList.length"><td colspan="8" class="py-8 text-center text-gray-600">No OTP requests yet</td></tr>
-            </tbody>
-          </table>
+      <!-- Filters -->
+      <div class="flex gap-3 flex-wrap">
+        <select v-model="filterDept" class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500">
+          <option value="">All Departments</option>
+          <option v-for="d in departments" :key="d" :value="d">{{ d }}</option>
+        </select>
+        <select v-model="filterAgent" class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500">
+          <option value="">All Bots</option>
+          <option v-for="a in allAgents" :key="a.slug" :value="a.slug">{{ a.emoji }} {{ a.name }}</option>
+        </select>
+        <select v-model="filterStatus" class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500">
+          <option value="">All Status</option>
+          <option value="paired">🟢 Paired</option>
+          <option value="unpaired">🔴 Unpaired</option>
+        </select>
+        <button v-if="filterDept || filterAgent || filterStatus" @click="filterDept='';filterAgent='';filterStatus=''"
+          class="text-xs text-gray-400 hover:text-gray-200 px-2">✕ Clear</button>
+        <div v-if="loading" class="text-xs text-gray-500 ml-auto flex items-center">Loading…</div>
+      </div>
+
+      <!-- Table -->
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="text-gray-500 border-b border-gray-800">
+              <th class="text-left py-2 pr-4 font-medium">User</th>
+              <th class="text-left py-2 pr-4 font-medium">Department</th>
+              <th class="text-left py-2 pr-4 font-medium">Role</th>
+              <th class="text-left py-2 pr-4 font-medium">Status</th>
+              <th class="text-left py-2 pr-4 font-medium">Bot(s)</th>
+              <th class="text-left py-2 pr-4 font-medium">Telegram</th>
+              <th class="text-left py-2 pr-4 font-medium">Last Seen</th>
+              <th class="text-left py-2 font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="u in filtered" :key="u.id" class="border-b border-gray-800/50 hover:bg-gray-800/30">
+              <td class="py-2.5 pr-4">
+                <div class="text-gray-200 font-medium">{{ u.name }}</div>
+                <div class="text-blue-400 text-[11px]">{{ u.email }}</div>
+              </td>
+              <td class="py-2.5 pr-4 text-gray-400">{{ u.department || '—' }}</td>
+              <td class="py-2.5 pr-4">
+                <span :class="roleBadge(u.role)" class="px-2 py-0.5 rounded border">{{ u.role }}</span>
+              </td>
+              <td class="py-2.5 pr-4">
+                <span v-if="u.bindings.length" class="text-green-400 flex items-center gap-1">🟢 Paired</span>
+                <span v-else class="text-gray-600 flex items-center gap-1">🔴 Unpaired</span>
+              </td>
+              <td class="py-2.5 pr-4">
+                <div class="flex flex-wrap gap-1">
+                  <span v-for="b in u.bindings" :key="b.id"
+                    class="px-2 py-0.5 rounded-full bg-indigo-900/40 text-indigo-300 border border-indigo-700 text-[10px] whitespace-nowrap">
+                    {{ b.agent_name || b.agent_slug || '?' }}
+                  </span>
+                  <span v-if="!u.bindings.length" class="text-gray-600">—</span>
+                </div>
+              </td>
+              <td class="py-2.5 pr-4">
+                <div v-if="u.bindings.length" class="space-y-0.5">
+                  <div v-for="b in u.bindings" :key="b.id" class="text-gray-400">
+                    <span v-if="b.telegram_username" class="text-gray-300">@{{ b.telegram_username }}</span>
+                    <span v-else class="font-mono">{{ b.telegram_id }}</span>
+                  </div>
+                </div>
+                <span v-else class="text-gray-600">—</span>
+              </td>
+              <td class="py-2.5 pr-4">
+                <div v-if="u.bindings.length" class="space-y-0.5">
+                  <div v-for="b in u.bindings" :key="b.id" class="text-gray-500 whitespace-nowrap">{{ fmtRel(b.last_seen_at) }}</div>
+                </div>
+                <span v-else class="text-gray-600">—</span>
+              </td>
+              <td class="py-2.5">
+                <div class="flex flex-col gap-1">
+                  <button @click="openAssign" class="text-[10px] px-2 py-0.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-300 border border-blue-800/50 transition-colors whitespace-nowrap">＋ Assign</button>
+                  <button v-for="b in u.bindings" :key="b.id" @click="unbind(b.id)"
+                    class="text-[10px] px-2 py-0.5 rounded bg-red-900/40 hover:bg-red-800/60 text-red-400 border border-red-800/50 transition-colors whitespace-nowrap">
+                    Unbind {{ b.agent_name || b.agent_slug || '' }}
+                  </button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="!filtered.length">
+              <td colspan="8" class="py-10 text-center text-gray-600">{{ loading ? 'Loading…' : 'No users found' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- Assign Modal -->
+      <div v-if="modal.open" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" @click.self="modal.open=false">
+        <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-96 shadow-2xl">
+          <h2 class="text-sm font-semibold text-white mb-4">🔗 Assign Telegram Binding</h2>
+          <div class="space-y-3">
+            <div>
+              <label class="text-gray-500 text-xs block mb-1">Account <span class="text-red-400">*</span></label>
+              <select v-model="modal.account_id" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+                <option value="">Select account…</option>
+                <option v-for="u in users" :key="u.id" :value="u.id">{{ u.name }} ({{ u.email }})</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-gray-500 text-xs block mb-1">Telegram ID <span class="text-red-400">*</span></label>
+              <input v-model="modal.telegram_id" placeholder="e.g. 6759764460" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500 font-mono" />
+            </div>
+            <div>
+              <label class="text-gray-500 text-xs block mb-1">Telegram Name</label>
+              <input v-model="modal.telegram_name" placeholder="Display name" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500" />
+            </div>
+            <div>
+              <label class="text-gray-500 text-xs block mb-1">Bot <span class="text-red-400">*</span></label>
+              <select v-model="modal.agent_id" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+                <option value="">Select bot…</option>
+                <option v-for="a in allAgents" :key="a.id" :value="a.id">{{ a.emoji }} {{ a.name }}</option>
+              </select>
+            </div>
+            <div v-if="modal.error" class="text-red-400 text-xs">❌ {{ modal.error }}</div>
+            <div class="flex gap-2 pt-2">
+              <button @click="submitAssign" :disabled="modal.saving"
+                class="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
+                {{ modal.saving ? 'Saving…' : 'Confirm Assign' }}
+              </button>
+              <button @click="modal.open=false" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs transition-colors">Cancel</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -4361,6 +4536,7 @@ const routes = [
   { path: '/knowledge',     component: Knowledge },
   { path: '/accounts',      component: Accounts },
   { path: '/accounts/:id',  component: AccountProfile },
+  { path: '/bindings',      component: Bindings },
   { path: '/skills',        component: Skills },
   { path: '/reports',       component: Reports },
   { path: '/settings',      component: Settings },
@@ -4387,6 +4563,7 @@ const App = {
       { path: '/tasks',         label: 'Tasks',         icon: '✓' },
       { path: '/knowledge',     label: 'Knowledge',     icon: '📚' },
       { path: '/accounts',      label: 'Accounts',      icon: '👤' },
+      { path: '/bindings',      label: 'Bindings',      icon: '🔗' },
       { path: '/skills',        label: 'Skills',        icon: '⚡' },
       { path: '/settings',      label: 'Settings',      icon: '⚙️' },
     ];

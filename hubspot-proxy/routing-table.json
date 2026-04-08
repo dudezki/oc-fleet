@@ -3,10 +3,43 @@
   "positionGroups": {
     "Dev_IT": {
       "accessLevel": "admin",
-      "positions": ["Senior Lead Developer", "Lead Developer", "Developer", "IT Manager", "System Administrator"],
-      "objects": ["contacts", "companies", "deals", "owners", "2-20106951"],
-      "portal": ["4950628", "21203560"],
+      "positions": [
+        "Senior Lead Developer",
+        "Lead Developer",
+        "Developer",
+        "IT Manager",
+        "System Administrator"
+      ],
+      "objects": [
+        "contacts",
+        "companies",
+        "deals",
+        "owners",
+        "2-20106951"
+      ],
+      "portal": [
+        "4950628",
+        "21203560"
+      ],
       "database": true
+    },
+    "QA": {
+      "accessLevel": "org",
+      "portal": [
+        "4950628"
+      ],
+      "objects": [
+        "contacts",
+        "companies",
+        "deals"
+      ],
+      "positions": [
+        "Quality Assurance Analyst",
+        "Senior Quality Assurance Analyst",
+        "QA Analyst",
+        "Marketing QA"
+      ],
+      "database": false
     }
   },
   "positionGroupOverrides": {},
@@ -16,14 +49,20 @@
       "position": "Senior Lead Developer",
       "department": "IT",
       "ownerId": "578668118",
-      "portals": ["4950628", "21203560"]
+      "portals": [
+        "4950628",
+        "21203560"
+      ]
     },
     "luckyf@callboxinc.com": {
       "name": "Lucky Faderon",
       "position": "Senior Lead Developer",
       "department": "Engineering",
       "ownerId": null,
-      "portals": ["4950628", "21203560"]
+      "portals": [
+        "4950628",
+        "21203560"
+      ]
     }
   }
 }

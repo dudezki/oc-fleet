@@ -2501,6 +2501,164 @@ app.get('/api/gc-pairings', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Integrations ────────────────────────────────────────────────────────────
+const ROUTING_TABLE_PATH = '/home/dev-user/Projects/oc-fleet/hubspot-proxy/routing-table.json';
+const HUBSPOT_PORTALS = { '4950628': 'MarketingCRM', '21203560': 'OneCRM' };
+
+// GET /api/integrations/groups — position groups from routing-table.json
+app.get('/api/integrations/groups', (req, res) => {
+  try {
+    const rt = JSON.parse(fs.readFileSync(ROUTING_TABLE_PATH, 'utf8'));
+    const groups = Object.entries(rt.positionGroups || {}).map(([name, g]) => ({
+      name, accessLevel: g.accessLevel, canWrite: g.canWrite ?? (g.accessLevel === 'admin' || ['Dev_IT','Finance','Executive'].includes(name)),
+      portals: g.portal || [], objects: g.objects || [], positions: g.positions || []
+    }));
+    res.json(groups);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT /api/integrations/groups/:name — update a position group
+app.put('/api/integrations/groups/:name', (req, res) => {
+  try {
+    const rt = JSON.parse(fs.readFileSync(ROUTING_TABLE_PATH, 'utf8'));
+    const { name } = req.params;
+    if (!rt.positionGroups[name]) return res.status(404).json({ error: 'Group not found' });
+    const { accessLevel, canWrite, portals, objects, positions } = req.body;
+    if (accessLevel) rt.positionGroups[name].accessLevel = accessLevel;
+    if (canWrite !== undefined) rt.positionGroups[name].canWrite = canWrite;
+    if (portals) rt.positionGroups[name].portal = portals;
+    if (objects) rt.positionGroups[name].objects = objects;
+    if (positions) rt.positionGroups[name].positions = positions;
+    fs.writeFileSync(ROUTING_TABLE_PATH, JSON.stringify(rt, null, 2));
+    res.json({ success: true, group: rt.positionGroups[name] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/integrations/groups — create a new position group
+app.post('/api/integrations/groups', (req, res) => {
+  try {
+    const rt = JSON.parse(fs.readFileSync(ROUTING_TABLE_PATH, 'utf8'));
+    const { name, accessLevel, canWrite, portals, objects, positions } = req.body;
+    if (!name) return res.status(400).json({ error: 'name required' });
+    rt.positionGroups[name] = { accessLevel: accessLevel || 'owner', canWrite: canWrite ?? false, portal: portals || [], objects: objects || ['contacts','companies','deals'], positions: positions || [] };
+    fs.writeFileSync(ROUTING_TABLE_PATH, JSON.stringify(rt, null, 2));
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/integrations/groups/:name
+app.delete('/api/integrations/groups/:name', (req, res) => {
+  try {
+    const rt = JSON.parse(fs.readFileSync(ROUTING_TABLE_PATH, 'utf8'));
+    delete rt.positionGroups[req.params.name];
+    fs.writeFileSync(ROUTING_TABLE_PATH, JSON.stringify(rt, null, 2));
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/integrations/users — all users with any integration, optionally filtered by ?integration=
+app.get('/api/integrations/users', async (req, res) => {
+  try {
+    const rt = JSON.parse(fs.readFileSync(ROUTING_TABLE_PATH, 'utf8'));
+    const filterIntegration = req.query.integration || null;
+    const r = await pgPool.query(`
+      SELECT ui.id, ui.account_id, ui.integration, ui.portal_id, ui.access_level, ui.enabled,
+             ui.meta, ui.scopes, ui.note, ui.updated_at, ui.last_used_at,
+             a.name, a.email, a.department, a.role
+      FROM fleet.user_integrations ui
+      JOIN fleet.accounts a ON a.id = ui.account_id
+      WHERE ui.org_id = $1 ${filterIntegration ? 'AND ui.integration = $2' : ''}
+      ORDER BY ui.integration, a.name, ui.portal_id`,
+      filterIntegration ? [ORG_ID, filterIntegration] : [ORG_ID]);
+    const users = r.rows.map(row => {
+      const roles = row.meta?.roles || [];
+      const pos = row.meta?.position || null;
+      let positionGroup = 'standard';
+      if (row.integration === 'hubspot') {
+        if (roles.includes('system_developer') || roles.includes('it_admin')) positionGroup = 'Dev_IT';
+        else if (roles.some(r => ['quality_analyst','qa_user','marketing qa','memo_qa_access'].includes(r))) positionGroup = 'QA';
+        else if (roles.includes('finance')) positionGroup = 'Finance';
+        else if (roles.includes('executive') || roles.includes('exec')) positionGroup = 'Executive';
+        else if (roles.includes('manager')) positionGroup = 'Manager';
+        else if (pos) {
+          for (const [gname, g] of Object.entries(rt.positionGroups || {})) {
+            if ((g.positions || []).map(p => p.toLowerCase()).includes(pos.toLowerCase())) { positionGroup = gname; break; }
+          }
+        }
+      }
+      const isOverride = row.meta?.access_override === true;
+      return {
+        id: row.id, account_id: row.account_id, integration: row.integration,
+        portal_id: row.portal_id,
+        portal_name: row.integration === 'hubspot' ? (HUBSPOT_PORTALS[row.portal_id] || row.portal_id) : (row.meta?.domain || row.portal_id || null),
+        access_level: row.access_level, enabled: row.enabled,
+        name: row.name, email: row.email, department: row.department, role: row.role,
+        position: pos, roles, positionGroup, isOverride, note: row.note,
+        last_used_at: row.last_used_at, updated_at: row.updated_at
+      };
+    });
+    res.json(users);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/integrations/users/:id — update access_level, canWrite, enabled for one user_integration row
+app.patch('/api/integrations/users/:id', async (req, res) => {
+  try {
+    const { access_level, enabled, note, roles } = req.body;
+    const sets = [];
+    const vals = [];
+    let i = 1;
+    if (access_level !== undefined) { sets.push(`access_level=$${i++}`); vals.push(access_level); }
+    if (enabled !== undefined) { sets.push(`enabled=$${i++}`); vals.push(enabled); }
+    if (note !== undefined) { sets.push(`note=$${i++}`); vals.push(note); }
+    if (roles !== undefined) {
+      sets.push(`meta = meta || jsonb_build_object('roles', $${i++}::jsonb, 'access_override', true)`);
+      vals.push(JSON.stringify(roles));
+    }
+    if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
+    sets.push(`updated_at=now()`);
+    vals.push(req.params.id);
+    await pgPool.query(`UPDATE fleet.user_integrations SET ${sets.join(',')} WHERE id=$${i}`, vals);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/integrations/bulk — bulk update access_level for all users matching a positionGroup
+app.post('/api/integrations/bulk', async (req, res) => {
+  try {
+    const { positionGroup, portal_id, access_level, enabled } = req.body;
+    if (!positionGroup) return res.status(400).json({ error: 'positionGroup required' });
+    const rt = JSON.parse(fs.readFileSync(ROUTING_TABLE_PATH, 'utf8'));
+    const group = rt.positionGroups[positionGroup];
+    if (!group) return res.status(404).json({ error: 'Group not found' });
+    // update group default in routing table
+    if (access_level) rt.positionGroups[positionGroup].accessLevel = access_level;
+    fs.writeFileSync(ROUTING_TABLE_PATH, JSON.stringify(rt, null, 2));
+    // update all matching DB rows that don't have an override
+    const sets = ['updated_at=now()'];
+    const vals = [];
+    let i = 1;
+    if (access_level) { sets.push(`access_level=$${i++}`); vals.push(access_level); }
+    if (enabled !== undefined) { sets.push(`enabled=$${i++}`); vals.push(enabled); }
+    // match by roles in meta
+    const roleMatches = group.positions?.length
+      ? group.positions.map((_, idx) => `meta->'roles' @> $${i + idx}::jsonb`)
+      : [];
+    // build role values
+    const rolePlaceholders = group.positions?.map(p => JSON.stringify([p])) || [];
+    const whereExtra = portal_id ? `AND portal_id=$${i + rolePlaceholders.length}` : '';
+    if (portal_id) rolePlaceholders.push(portal_id);
+    i += rolePlaceholders.length;
+    const whereRoles = roleMatches.length ? `AND (${roleMatches.join(' OR ')})` : '';
+    const sql = `UPDATE fleet.user_integrations SET ${sets.join(',')}
+      WHERE org_id='${ORG_ID}' AND integration='hubspot'
+      AND (meta->>'access_override')::boolean IS NOT TRUE
+      ${whereRoles} ${whereExtra}`;
+    const result = await pgPool.query(sql, [...vals, ...rolePlaceholders]);
+    res.json({ success: true, updated: result.rowCount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // SPA fallback — serve index.html for all non-API routes
 app.get('*', (req, res) => {
   if (!req.path.startsWith('/api/')) {

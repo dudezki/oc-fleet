@@ -1,5 +1,7 @@
 const http = require('http');
 const https = require('https');
+// Load .env from project root
+try { require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }); } catch {}
 const { Client } = require('pg');
 const { processConversation, embedTexts, chunkText } = require('./chunker');
 
@@ -184,7 +186,7 @@ const smtpTransport = nodemailer.createTransport({
 });
 
 async function sendOTPEmail(to, otp, name) {
-  if (!process.env.SMTP_USER) throw new Error('SMTP_USER not set');
+  if (!process.env.SMTP_USER && !smtpTransport.options?.auth?.user) throw new Error('SMTP_USER not set');
   const info = await smtpTransport.sendMail({
     from: SMTP_FROM,
     to,
@@ -534,16 +536,22 @@ http.createServer(async (req, res) => {
       } else if (fn === 'pairing/check') {
         // p: { telegram_id, org_id, agent_id?, message?, message_id? }
         const r = await pg.query(
-          `SELECT tb.telegram_id, tb.telegram_name, tb.bound_at,
+          `SELECT tb.telegram_id, tb.telegram_name, tb.bound_at, tb.agent_id AS binding_agent_id,
                   a.email, a.name, a.role, a.department, a.permissions, a.is_active
            FROM fleet.telegram_bindings tb
            JOIN fleet.accounts a ON a.id = tb.account_id
            WHERE tb.telegram_id = $1 AND tb.org_id = $2`,
           [p.telegram_id, p.org_id]
         );
-        result = r.rows.length > 0
-          ? { bound: true, user: r.rows[0] }
-          : { bound: false };
+        if (r.rows.length > 0) {
+          const bound_to_this_agent = p.agent_id
+            ? r.rows.some(b => b.binding_agent_id === p.agent_id)
+            : false;
+          const { binding_agent_id, ...user } = r.rows[0];
+          result = { bound: true, bound_to_this_agent, user };
+        } else {
+          result = { bound: false };
+        }
 
         // Auto-log conversation if agent_id + message provided (fire and forget)
         if (p.agent_id && p.message && p.telegram_id) {
@@ -693,13 +701,25 @@ http.createServer(async (req, res) => {
             [p.org_id, p.email]
           );
           const account = acct.rows[0];
-          await pg.query(
-            `INSERT INTO fleet.telegram_bindings (org_id, telegram_id, telegram_username, telegram_name, account_id, agent_id)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT (org_id, telegram_id) DO UPDATE SET
-               telegram_name=EXCLUDED.telegram_name, account_id=EXCLUDED.account_id, last_seen_at=now()`,
-            [p.org_id, p.telegram_id, p.telegram_username||null, p.telegram_name||null, account.id, p.agent_id||null]
+          // Upsert binding — handle null agent_id (nulls don't match in unique index)
+          const existingBinding = await pg.query(
+            `SELECT id FROM fleet.telegram_bindings
+             WHERE telegram_id=$1 AND org_id=$2 AND ($3::uuid IS NULL AND agent_id IS NULL OR agent_id=$3)`,
+            [p.telegram_id, p.org_id, p.agent_id||null]
           );
+          if (existingBinding.rows.length > 0) {
+            await pg.query(
+              `UPDATE fleet.telegram_bindings SET telegram_name=$1, telegram_username=$2, account_id=$3, last_seen_at=now()
+               WHERE id=$4`,
+              [p.telegram_name||null, p.telegram_username||null, account.id, existingBinding.rows[0].id]
+            );
+          } else {
+            await pg.query(
+              `INSERT INTO fleet.telegram_bindings (org_id, telegram_id, telegram_username, telegram_name, account_id, agent_id)
+               VALUES ($1,$2,$3,$4,$5,$6)`,
+              [p.org_id, p.telegram_id, p.telegram_username||null, p.telegram_name||null, account.id, p.agent_id||null]
+            );
+          }
           result = {
             success: true,
             user: { email: account.email, name: account.name, role: account.role, department: account.department, permissions: account.permissions }

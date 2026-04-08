@@ -126,6 +126,40 @@ async function resolveOwner(email, token) {
   return { ownerId: owner.id, teams: owner.teams || [], primaryTeam: owner.teams?.[0] || null };
 }
 
+// --- Role-based helpers for DB users ---
+
+function resolvePositionGroupFromRoles(roles, position) {
+  if (roles.includes('system_developer') || roles.includes('it_admin')) return 'Dev_IT';
+  if (roles.includes('quality_analyst') || roles.includes('qa_user') || roles.includes('marketing qa') || roles.includes('memo_qa_access')) return 'QA';
+  if (roles.includes('finance')) return 'Finance';
+  if (roles.includes('executive') || roles.includes('exec')) return 'Executive';
+  if (roles.includes('manager')) return 'Manager';
+  // fallback: match by position string
+  try {
+    const rt = loadRoutingTable();
+    const group = resolvePositionGroup(null, position, rt);
+    if (group) return group._groupName;
+  } catch {}
+  return 'standard';
+}
+
+function resolveAllowedObjectsFromRoles(roles, accessLevel) {
+  if (roles.includes('system_developer') || roles.includes('it_admin')) return ['contacts', 'companies', 'deals', 'owners', '2-20106951'];
+  if (roles.includes('quality_analyst') || roles.includes('qa_user') || roles.includes('marketing qa') || roles.includes('memo_qa_access')) return ['contacts', 'companies', 'deals'];
+  return ['contacts', 'companies', 'deals'];
+}
+
+function resolveCanWriteFromRoles(roles, accessLevel) {
+  if (roles.includes('system_developer') || roles.includes('it_admin') || roles.includes('finance') || roles.includes('executive')) return true;
+  if (roles.includes('quality_analyst') || roles.includes('qa_user') || roles.includes('marketing qa') || roles.includes('memo_qa_access')) return false;
+  return accessLevel === 'org' || accessLevel === 'admin';
+}
+
+function resolveWriteScopeFromRoles(roles, accessLevel) {
+  if (roles.includes('system_developer') || roles.includes('it_admin') || roles.includes('finance') || roles.includes('executive')) return 'any';
+  return 'owned';
+}
+
 // --- DB identity lookup (user_integrations) ---
 
 async function resolveIdentityFromDB(email, portalId) {
@@ -146,13 +180,13 @@ async function resolveIdentityFromDB(email, portalId) {
     name: row.meta?.name || email,
     position: row.meta?.position || null,
     department: row.meta?.department || null,
-    positionGroup: row.meta?.roles?.includes('system_developer') ? 'Dev_IT' : 'Dev_IT',
+    positionGroup: resolvePositionGroupFromRoles(row.meta?.roles || [], row.meta?.position),
     accessLevel: row.access_level || 'standard',
     allowedPortals: [pid],
-    allowedObjects: ['contacts', 'companies', 'deals', 'owners', '2-20106951'],
+    allowedObjects: resolveAllowedObjectsFromRoles(row.meta?.roles || [], row.access_level),
     topics: [],
-    canWrite: true,
-    writeScope: 'any',
+    canWrite: resolveCanWriteFromRoles(row.meta?.roles || [], row.access_level),
+    writeScope: resolveWriteScopeFromRoles(row.meta?.roles || [], row.access_level),
     database: true,
     ownerId: row.meta?.owner_id || null,
     hubspotTeams: [],
@@ -291,7 +325,7 @@ const DEFAULT_DATE_FIELD = {
 function buildOwnershipFilterGroups(identity, objectType, additionalFilters = [], portalId = null) {
   const accessLevel = identity.accessOverride || identity.accessLevel;
 
-  if (accessLevel === 'org') {
+  if (accessLevel === 'org' || accessLevel === 'admin') {
     return additionalFilters.length > 0 ? [{ filters: additionalFilters }] : [];
   }
 
@@ -347,7 +381,7 @@ app.get('/identity/:email', async (req, res) => {
 
 app.post('/query', async (req, res) => {
   try {
-    const { email, portal_id, object, filters, properties, limit, countOnly, dateFilter, department } = req.body;
+    const { email, portal_id, object, filters, properties, limit, countOnly, dateFilter, department, record_id } = req.body;
     if (!email || !portal_id || !object) return res.status(400).json({ error: 'email, portal_id, and object are required' });
 
     const identity = await resolveIdentity(email, portal_id);
@@ -370,11 +404,19 @@ app.post('/query', async (req, res) => {
     const baseFilters = Array.isArray(filters) ? filters : [];
     const extraFilters = [...baseFilters];
 
-    const ytdStart = new Date(new Date().getFullYear(), 0, 1).getTime();
-    const appliedDateFilter = dateFilter !== undefined ? dateFilter : {
+    // Date filter logic:
+    // - Specific record lookup (record_id passed, or filters contain an ID match) → no date filter
+    // - Explicit dateFilter passed → use it
+    // - Broad/group query → default to last 3 years
+    const isSpecificLookup = !!record_id ||
+      (Array.isArray(filters) && filters.some(f => f.propertyName === 'hs_object_id' && (f.operator === 'EQ' || f.operator === 'IN')));
+    const threeYearsAgo = new Date();
+    threeYearsAgo.setFullYear(threeYearsAgo.getFullYear() - 3);
+    const defaultDateFilter = isSpecificLookup ? null : {
       field: DEFAULT_DATE_FIELD[object] || 'hs_createdate',
-      start: ytdStart,
+      start: threeYearsAgo.getTime(),
     };
+    const appliedDateFilter = dateFilter !== undefined ? dateFilter : defaultDateFilter;
 
     if (appliedDateFilter && typeof appliedDateFilter === 'object') {
       if (appliedDateFilter.start && appliedDateFilter.end) {

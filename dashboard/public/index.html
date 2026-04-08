@@ -959,6 +959,7 @@ const Bindings = {
     const filterDept = ref('');
     const filterAgent = ref('');
     const filterStatus = ref('');
+    const filterSearch = ref('');
 
     const departments = computed(() => {
       const deps = new Set(users.value.map(u => u.department).filter(Boolean));
@@ -966,11 +967,18 @@ const Bindings = {
     });
 
     const filtered = computed(() => {
+      const q = filterSearch.value.trim().toLowerCase();
       return users.value.filter(u => {
         if (filterDept.value && u.department !== filterDept.value) return false;
         if (filterAgent.value && !u.bindings.some(b => b.agent_slug === filterAgent.value)) return false;
         if (filterStatus.value === 'paired' && !u.bindings.length) return false;
         if (filterStatus.value === 'unpaired' && u.bindings.length) return false;
+        if (q) {
+          const tgIds = u.bindings.map(b => b.telegram_id || '').join(' ');
+          const tgNames = u.bindings.map(b => (b.telegram_username || '') + ' ' + (b.telegram_name || '')).join(' ');
+          const haystack = [u.name, u.email, u.department, u.role, tgIds, tgNames].join(' ').toLowerCase();
+          if (!haystack.includes(q)) return false;
+        }
         return true;
       });
     });
@@ -999,6 +1007,19 @@ const Bindings = {
 
     const roleBadge = (r) => ({ admin: 'bg-red-900/40 text-red-300 border-red-800', team_lead: 'bg-yellow-900/40 text-yellow-300 border-yellow-800', agent: 'bg-gray-700 text-gray-300 border-gray-600' }[r] || 'bg-gray-700 text-gray-300');
 
+    // Bulk select
+    const selectedIds = ref(new Set());
+    const allSelected = computed(() => filtered.value.length > 0 && filtered.value.every(u => selectedIds.value.has(u.id)));
+    function toggleSelect(id) {
+      const s = new Set(selectedIds.value);
+      s.has(id) ? s.delete(id) : s.add(id);
+      selectedIds.value = s;
+    }
+    function toggleAll() {
+      if (allSelected.value) { selectedIds.value = new Set(); }
+      else { selectedIds.value = new Set(filtered.value.map(u => u.id)); }
+    }
+
     // Assign modal
     const modal = reactive({
       open: false,
@@ -1010,14 +1031,69 @@ const Bindings = {
       error: ''
     });
 
-    function openAssign() {
+    function openAssign(user) {
       modal.open = true;
-      modal.account_id = '';
-      modal.telegram_id = '';
-      modal.telegram_name = '';
+      modal.account_id = user ? String(user.id) : '';
+      modal.telegram_id = user?.bindings?.[0]?.telegram_id || '';
+      modal.telegram_name = user?.bindings?.[0]?.telegram_name || user?.bindings?.[0]?.telegram_username || '';
       modal.agent_id = '';
       modal.saving = false;
       modal.error = '';
+    }
+
+    // Bulk assign modal
+    const bulkModal = reactive({
+      open: false,
+      agent_id: '',
+      rows: [],   // [{ user, telegram_id, telegram_name }]
+      saving: false,
+      progress: 0,
+      total: 0,
+      error: '',
+      results: []
+    });
+
+    function openBulkAssign() {
+      const selected = users.value.filter(u => selectedIds.value.has(u.id));
+      bulkModal.rows = selected.map(u => ({
+        user: u,
+        telegram_id: u.bindings?.[0]?.telegram_id || '',
+        telegram_name: u.bindings?.[0]?.telegram_name || u.bindings?.[0]?.telegram_username || ''
+      }));
+      bulkModal.agent_id = '';
+      bulkModal.saving = false;
+      bulkModal.progress = 0;
+      bulkModal.total = selected.length;
+      bulkModal.error = '';
+      bulkModal.results = [];
+      bulkModal.open = true;
+    }
+
+    async function submitBulkAssign() {
+      if (!bulkModal.agent_id) { bulkModal.error = 'Select a bot first'; return; }
+      const incomplete = bulkModal.rows.filter(r => !r.telegram_id);
+      if (incomplete.length) { bulkModal.error = `${incomplete.length} row(s) missing Telegram ID`; return; }
+      bulkModal.saving = true;
+      bulkModal.error = '';
+      bulkModal.results = [];
+      bulkModal.progress = 0;
+      for (const row of bulkModal.rows) {
+        try {
+          const r = await fetch('/api/bindings/assign', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ account_id: row.user.id, telegram_id: row.telegram_id, telegram_name: row.telegram_name || null, agent_id: bulkModal.agent_id })
+          });
+          const d = await r.json();
+          bulkModal.results.push({ name: row.user.name, ok: !!d.success, msg: d.error || '' });
+        } catch(e) {
+          bulkModal.results.push({ name: row.user.name, ok: false, msg: e.message });
+        }
+        bulkModal.progress++;
+      }
+      bulkModal.saving = false;
+      await loadBindings();
+      selectedIds.value = new Set();
     }
 
     async function submitAssign() {
@@ -1057,8 +1133,10 @@ const Bindings = {
       } catch {}
     }
 
-    return { users, filtered, allAgents, loading, filterDept, filterAgent, filterStatus,
+    return { users, filtered, allAgents, loading, filterDept, filterAgent, filterStatus, filterSearch,
              departments, stats, roleBadge, modal, openAssign, submitAssign, unbind,
+             selectedIds, allSelected, toggleSelect, toggleAll,
+             bulkModal, openBulkAssign, submitBulkAssign,
              fmtDate, fmtRel };
   },
   template: `
@@ -1066,7 +1144,10 @@ const Bindings = {
       <!-- Header -->
       <div class="flex items-center justify-between">
         <h1 class="text-xl font-bold text-white">Bindings <span class="text-gray-600 text-sm font-normal">({{ stats.total }})</span></h1>
-        <button @click="openAssign" class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors">＋ Assign</button>
+        <div class="flex items-center gap-2">
+          <button v-if="selectedIds.size > 0" @click="openBulkAssign" class="text-xs px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 text-white font-medium transition-colors">⚡ Bulk Assign ({{ selectedIds.size }})</button>
+          <button @click="openAssign(null)" class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors">＋ Assign</button>
+        </div>
       </div>
 
       <!-- Stats -->
@@ -1087,6 +1168,7 @@ const Bindings = {
 
       <!-- Filters -->
       <div class="flex gap-3 flex-wrap">
+        <input v-model="filterSearch" placeholder="Search name, email, telegram ID…" class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500 w-56 placeholder-gray-600" />
         <select v-model="filterDept" class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500">
           <option value="">All Departments</option>
           <option v-for="d in departments" :key="d" :value="d">{{ d }}</option>
@@ -1100,7 +1182,7 @@ const Bindings = {
           <option value="paired">🟢 Paired</option>
           <option value="unpaired">🔴 Unpaired</option>
         </select>
-        <button v-if="filterDept || filterAgent || filterStatus" @click="filterDept='';filterAgent='';filterStatus=''"
+        <button v-if="filterDept || filterAgent || filterStatus || filterSearch" @click="filterDept='';filterAgent='';filterStatus='';filterSearch=''"
           class="text-xs text-gray-400 hover:text-gray-200 px-2">✕ Clear</button>
         <div v-if="loading" class="text-xs text-gray-500 ml-auto flex items-center">Loading…</div>
       </div>
@@ -1110,6 +1192,7 @@ const Bindings = {
         <table class="w-full text-xs">
           <thead>
             <tr class="text-gray-500 border-b border-gray-800">
+              <th class="py-2 pr-3 w-6"><input type="checkbox" :checked="allSelected" @change="toggleAll" class="accent-blue-500 cursor-pointer" /></th>
               <th class="text-left py-2 pr-4 font-medium">User</th>
               <th class="text-left py-2 pr-4 font-medium">Department</th>
               <th class="text-left py-2 pr-4 font-medium">Role</th>
@@ -1121,7 +1204,8 @@ const Bindings = {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="u in filtered" :key="u.id" class="border-b border-gray-800/50 hover:bg-gray-800/30">
+            <tr v-for="u in filtered" :key="u.id" class="border-b border-gray-800/50 hover:bg-gray-800/30" :class="selectedIds.has(u.id) ? 'bg-blue-900/10' : ''">
+              <td class="py-2.5 pr-3"><input type="checkbox" :checked="selectedIds.has(u.id)" @change="toggleSelect(u.id)" class="accent-blue-500 cursor-pointer" /></td>
               <td class="py-2.5 pr-4">
                 <div class="text-gray-200 font-medium">{{ u.name }}</div>
                 <div class="text-blue-400 text-[11px]">{{ u.email }}</div>
@@ -1160,7 +1244,7 @@ const Bindings = {
               </td>
               <td class="py-2.5">
                 <div class="flex flex-col gap-1">
-                  <button @click="openAssign" class="text-[10px] px-2 py-0.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-300 border border-blue-800/50 transition-colors whitespace-nowrap">＋ Assign</button>
+                  <button @click="openAssign(u)" class="text-[10px] px-2 py-0.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-300 border border-blue-800/50 transition-colors whitespace-nowrap">＋ Assign</button>
                   <button v-for="b in u.bindings" :key="b.id" @click="unbind(b.id)"
                     class="text-[10px] px-2 py-0.5 rounded bg-red-900/40 hover:bg-red-800/60 text-red-400 border border-red-800/50 transition-colors whitespace-nowrap">
                     Unbind {{ b.agent_name || b.agent_slug || '' }}
@@ -1169,10 +1253,60 @@ const Bindings = {
               </td>
             </tr>
             <tr v-if="!filtered.length">
-              <td colspan="8" class="py-10 text-center text-gray-600">{{ loading ? 'Loading…' : 'No users found' }}</td>
+              <td colspan="9" class="py-10 text-center text-gray-600">{{ loading ? 'Loading…' : 'No users found' }}</td>
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- Bulk Assign Modal -->
+      <div v-if="bulkModal.open" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" @click.self="!bulkModal.saving && (bulkModal.open=false)">
+        <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-[560px] max-h-[80vh] flex flex-col shadow-2xl">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-sm font-semibold text-white">⚡ Bulk Assign Telegram Binding</h2>
+            <button @click="bulkModal.open=false" :disabled="bulkModal.saving" class="text-gray-500 hover:text-white text-lg leading-none">✕</button>
+          </div>
+          <!-- Bot selector -->
+          <div class="mb-4">
+            <label class="text-gray-500 text-xs block mb-1">Bot <span class="text-red-400">*</span> <span class="text-gray-600">(applied to all)</span></label>
+            <select v-model="bulkModal.agent_id" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+              <option value="">Select bot…</option>
+              <option v-for="a in allAgents" :key="a.id" :value="a.id">{{ a.emoji }} {{ a.name }}</option>
+            </select>
+          </div>
+          <!-- Per-user rows -->
+          <div class="overflow-y-auto flex-1 mb-4 space-y-2">
+            <div v-for="(row, i) in bulkModal.rows" :key="row.user.id"
+              class="bg-gray-800/60 rounded-lg px-3 py-2 flex items-center gap-3">
+              <div class="flex-none w-36">
+                <div class="text-gray-200 text-xs font-medium truncate">{{ row.user.name }}</div>
+                <div class="text-gray-500 text-[10px] truncate">{{ row.user.email }}</div>
+              </div>
+              <input v-model="row.telegram_id" placeholder="Telegram ID" class="flex-1 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-gray-200 text-xs outline-none focus:border-blue-500 font-mono" />
+              <input v-model="row.telegram_name" placeholder="Name (opt)" class="w-28 bg-gray-900 border border-gray-700 rounded px-2 py-1 text-gray-400 text-xs outline-none focus:border-blue-500" />
+              <!-- result indicator -->
+              <span v-if="bulkModal.results[i]" :class="bulkModal.results[i].ok ? 'text-green-400' : 'text-red-400'" class="text-xs flex-none">{{ bulkModal.results[i].ok ? '✓' : '✗' }}</span>
+              <span v-else-if="bulkModal.saving && bulkModal.progress === i" class="text-blue-400 text-xs flex-none animate-pulse">…</span>
+            </div>
+          </div>
+          <!-- Progress bar (while saving) -->
+          <div v-if="bulkModal.saving" class="h-1.5 bg-gray-700 rounded-full overflow-hidden mb-3">
+            <div class="h-full bg-blue-500 transition-all" :style="{ width: bulkModal.total ? (bulkModal.progress/bulkModal.total*100)+'%' : '0%' }"></div>
+          </div>
+          <!-- Summary after done -->
+          <div v-if="!bulkModal.saving && bulkModal.results.length" class="text-xs mb-3 flex gap-4">
+            <span class="text-green-400 font-medium">✓ {{ bulkModal.results.filter(r=>r.ok).length }} assigned</span>
+            <span v-if="bulkModal.results.filter(r=>!r.ok).length" class="text-red-400 font-medium">✗ {{ bulkModal.results.filter(r=>!r.ok).length }} failed</span>
+          </div>
+          <div v-if="bulkModal.error" class="text-red-400 text-xs mb-3">❌ {{ bulkModal.error }}</div>
+          <div class="flex gap-2">
+            <button @click="submitBulkAssign" :disabled="bulkModal.saving || !!bulkModal.results.length"
+              class="flex-1 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white text-xs font-medium transition-colors">
+              {{ bulkModal.saving ? ('Assigning ' + bulkModal.progress + '/' + bulkModal.total + '…') : bulkModal.results.length ? 'Done' : ('Assign ' + bulkModal.rows.length + ' Users') }}
+            </button>
+            <button @click="bulkModal.open=false" :disabled="bulkModal.saving" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs transition-colors">Close</button>
+          </div>
+        </div>
       </div>
 
       <!-- Assign Modal -->
@@ -4352,6 +4486,360 @@ const Sessions = {
   `,
 };
 
+// ─── Integrations ─────────────────────────────────────────────────────────────
+const PORTAL_NAMES = { '4950628': 'MarketingCRM', '21203560': 'OneCRM' };
+const ACCESS_LEVELS = ['owner', 'team', 'org', 'admin'];
+const ALL_OBJECTS = ['contacts', 'companies', 'deals', 'owners', '2-20106951'];
+
+const Integrations = {
+  setup() {
+    const { ref, computed, onMounted, reactive } = Vue;
+    const groups = ref([]);
+    const users = ref([]);
+    const loading = ref(true);
+    const searchQ = ref('');
+    const showOverridesOnly = ref(false);
+    const activeIntegration = ref('all');
+    const groupModal = reactive({ open: false, isNew: false, name: '', accessLevel: 'owner', canWrite: false, portals: [], objects: ['contacts','companies','deals'], positions: '', saving: false, error: '' });
+    const userEdit = reactive({ open: false, row: null, access_level: '', enabled: true, note: '', saving: false, error: '' });
+    const bulkModal = reactive({ open: false, group: null, access_level: '', saving: false, result: null, error: '' });
+
+    async function load() {
+      loading.value = true;
+      const [g, u] = await Promise.all([
+        fetch('/api/integrations/groups').then(r=>r.json()).catch(()=>[]),
+        fetch('/api/integrations/users').then(r=>r.json()).catch(()=>[])
+      ]);
+      groups.value = Array.isArray(g) ? g : [];
+      users.value = Array.isArray(u) ? u : [];
+      loading.value = false;
+    }
+
+    const integrationTypes = computed(() => {
+      const types = [...new Set(users.value.map(u => u.integration))].sort();
+      return types;
+    });
+
+    const integrationIcons = { hubspot: '🟠', google: '🔵', slack: '💬', github: '🐙' };
+    const integrationLabels = { hubspot: 'HubSpot', google: 'Google', slack: 'Slack', github: 'GitHub' };
+    onMounted(load);
+
+    const groupCounts = computed(() => {
+      const m = {};
+      for (const u of users.value) m[u.positionGroup] = (m[u.positionGroup] || 0) + 1;
+      return m;
+    });
+
+    // Group users by email, then by integration
+    const groupedUsers = computed(() => {
+      const q = searchQ.value.trim().toLowerCase();
+      const intFilter = activeIntegration.value;
+      const map = {};
+      for (const u of users.value) {
+        if (intFilter !== 'all' && u.integration !== intFilter) continue;
+        if (showOverridesOnly.value && !u.isOverride) continue;
+        if (q && ![u.name, u.email, u.position, u.positionGroup, u.portal_name, u.integration].join(' ').toLowerCase().includes(q)) continue;
+        if (!map[u.account_id]) map[u.account_id] = { account_id: u.account_id, name: u.name, email: u.email, position: u.position, department: u.department, role: u.role, integrations: {} };
+        if (!map[u.account_id].integrations[u.integration]) map[u.account_id].integrations[u.integration] = [];
+        map[u.account_id].integrations[u.integration].push(u);
+      }
+      // Convert integrations map to sorted array
+      return Object.values(map).map(g => ({
+        ...g,
+        integrationList: Object.entries(g.integrations).sort(([a],[b]) => a.localeCompare(b))
+      }));
+    });
+
+    const filteredUsers = computed(() => {
+      const q = searchQ.value.trim().toLowerCase();
+      return users.value.filter(u => {
+        if (showOverridesOnly.value && !u.isOverride) return false;
+        if (q && ![u.name, u.email, u.position, u.positionGroup, u.portal_name].join(' ').toLowerCase().includes(q)) return false;
+        return true;
+      });
+    });
+
+    function openNewGroup() {
+      Object.assign(groupModal, { open: true, isNew: true, name: '', accessLevel: 'owner', canWrite: false, portals: [], objects: ['contacts','companies','deals'], positions: '', saving: false, error: '' });
+    }
+    function openEditGroup(g) {
+      Object.assign(groupModal, { open: true, isNew: false, name: g.name, accessLevel: g.accessLevel, canWrite: g.canWrite, portals: [...(g.portals||[])], objects: [...(g.objects||[])], positions: (g.positions||[]).join(', '), saving: false, error: '' });
+    }
+    async function saveGroup() {
+      groupModal.saving = true; groupModal.error = '';
+      const body = { accessLevel: groupModal.accessLevel, canWrite: groupModal.canWrite, portals: groupModal.portals, objects: groupModal.objects, positions: groupModal.positions.split(',').map(s=>s.trim()).filter(Boolean) };
+      if (groupModal.isNew) body.name = groupModal.name;
+      const url = groupModal.isNew ? '/api/integrations/groups' : '/api/integrations/groups/' + encodeURIComponent(groupModal.name);
+      const method = groupModal.isNew ? 'POST' : 'PUT';
+      const r = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+      const d = await r.json();
+      if (d.success) { groupModal.open = false; await load(); }
+      else groupModal.error = d.error || 'Failed';
+      groupModal.saving = false;
+    }
+    async function deleteGroup(name) {
+      if (!confirm('Delete group "' + name + '"? Existing user rows are unaffected.')) return;
+      await fetch('/api/integrations/groups/' + encodeURIComponent(name), { method: 'DELETE' });
+      await load();
+    }
+    function openUserEdit(row) {
+      Object.assign(userEdit, { open: true, row, access_level: row.access_level, enabled: row.enabled, note: row.note || '', saving: false, error: '' });
+    }
+    async function saveUserEdit() {
+      userEdit.saving = true; userEdit.error = '';
+      const r = await fetch('/api/integrations/users/' + userEdit.row.id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ access_level: userEdit.access_level, enabled: userEdit.enabled, note: userEdit.note }) });
+      const d = await r.json();
+      if (d.success) { userEdit.open = false; await load(); }
+      else userEdit.error = d.error || 'Failed';
+      userEdit.saving = false;
+    }
+    function openBulk(g) {
+      Object.assign(bulkModal, { open: true, group: g, access_level: g.accessLevel, saving: false, result: null, error: '' });
+    }
+    async function saveBulk() {
+      bulkModal.saving = true; bulkModal.error = ''; bulkModal.result = null;
+      const r = await fetch('/api/integrations/bulk', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ positionGroup: bulkModal.group.name, access_level: bulkModal.access_level }) });
+      const d = await r.json();
+      if (d.success) { bulkModal.result = d.updated; await load(); }
+      else bulkModal.error = d.error || 'Failed';
+      bulkModal.saving = false;
+    }
+
+    const levelColor = l => ({ org:'text-green-400', admin:'text-purple-400', team:'text-blue-400', owner:'text-gray-400', standard:'text-gray-500' }[l]||'text-gray-500');
+    const levelBg   = l => ({ org:'bg-green-900/30 border-green-800', admin:'bg-purple-900/30 border-purple-800', team:'bg-blue-900/30 border-blue-800', owner:'bg-gray-800 border-gray-700', standard:'bg-gray-800 border-gray-700' }[l]||'bg-gray-800 border-gray-700');
+
+    return { groups, users, filteredUsers, groupedUsers, loading, searchQ, showOverridesOnly, groupCounts,
+             activeIntegration, integrationTypes, integrationIcons, integrationLabels,
+             groupModal, userEdit, bulkModal,
+             openNewGroup, openEditGroup, saveGroup, deleteGroup,
+             openUserEdit, saveUserEdit, openBulk, saveBulk,
+             levelColor, levelBg, PORTAL_NAMES, ACCESS_LEVELS, ALL_OBJECTS };
+  },
+  template: `
+  <div class="p-6 space-y-8">
+    <div class="flex items-center justify-between">
+      <h1 class="text-xl font-bold text-white">Integrations <span class="text-gray-600 text-sm font-normal">HubSpot access rules</span></h1>
+      <button @click="openNewGroup" class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium transition-colors">+ New Group</button>
+    </div>
+
+    <!-- Layer 1: Position Groups -->
+    <div>
+      <h2 class="text-sm font-semibold text-gray-400 mb-3">Position Group Rules <span class="text-gray-600 text-xs font-normal">(one edit cascades to all users in the group)</span></h2>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="text-gray-500 border-b border-gray-800">
+              <th class="text-left py-2 pr-4 font-medium">Group</th>
+              <th class="text-left py-2 pr-4 font-medium">Portals</th>
+              <th class="text-left py-2 pr-4 font-medium">Access Level</th>
+              <th class="text-left py-2 pr-4 font-medium">Can Write</th>
+              <th class="text-left py-2 pr-4 font-medium">Users</th>
+              <th class="text-left py-2 pr-4 font-medium">Positions</th>
+              <th class="text-left py-2 font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="g in groups" :key="g.name" class="border-b border-gray-800/50 hover:bg-gray-800/20">
+              <td class="py-2.5 pr-4 font-medium text-white">{{ g.name }}</td>
+              <td class="py-2.5 pr-4">
+                <div class="flex gap-1 flex-wrap">
+                  <span v-for="p in g.portals" :key="p" class="px-1.5 py-0.5 rounded bg-indigo-900/40 text-indigo-300 border border-indigo-800 text-[10px]">{{ PORTAL_NAMES[p] || p }}</span>
+                  <span v-if="!g.portals.length" class="text-gray-600">All</span>
+                </div>
+              </td>
+              <td class="py-2.5 pr-4"><span :class="[levelBg(g.accessLevel), 'px-2 py-0.5 rounded border text-[10px] font-mono', levelColor(g.accessLevel)]">{{ g.accessLevel }}</span></td>
+              <td class="py-2.5 pr-4"><span :class="g.canWrite ? 'text-green-400' : 'text-gray-600'">{{ g.canWrite ? '\u2713 Yes' : '\u2715 No' }}</span></td>
+              <td class="py-2.5 pr-4 text-gray-400">{{ groupCounts[g.name] || 0 }}</td>
+              <td class="py-2.5 pr-4 text-gray-500 max-w-xs truncate">{{ (g.positions||[]).join(', ') || '\u2014' }}</td>
+              <td class="py-2.5">
+                <div class="flex gap-1.5">
+                  <button @click="openEditGroup(g)" class="text-[10px] px-2 py-0.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-300 border border-blue-800/50">Edit</button>
+                  <button @click="openBulk(g)" class="text-[10px] px-2 py-0.5 rounded bg-yellow-900/40 hover:bg-yellow-800/60 text-yellow-300 border border-yellow-800/50">Bulk Apply</button>
+                  <button @click="deleteGroup(g.name)" class="text-[10px] px-2 py-0.5 rounded bg-red-900/40 hover:bg-red-800/60 text-red-400 border border-red-800/50">\u00d7</button>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="!groups.length"><td colspan="7" class="py-8 text-center text-gray-600">{{ loading ? 'Loading\u2026' : 'No groups defined' }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Layer 2: User Access -->
+    <div>
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-gray-400">Connected Users <span class="text-gray-600 text-xs font-normal">(all integrations)</span></h2>
+        <div class="flex items-center gap-3">
+          <label class="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer">
+            <input type="checkbox" v-model="showOverridesOnly" class="accent-blue-500" /> Overrides only
+          </label>
+          <input v-model="searchQ" placeholder="Search user, email, integration…" class="bg-slate-800 border border-slate-700 text-white rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500 w-48 placeholder-gray-600" />
+        </div>
+      </div>
+      <!-- Integration tabs -->
+      <div class="flex gap-1.5 mb-3 flex-wrap">
+        <button @click="activeIntegration='all'"
+          :class="activeIntegration==='all' ? 'bg-blue-600 text-white border-blue-500' : 'bg-gray-800 text-gray-400 border-gray-700 hover:border-gray-500'"
+          class="text-xs px-3 py-1 rounded-lg border transition-colors">All</button>
+        <button v-for="t in integrationTypes" :key="t" @click="activeIntegration=t"
+          :class="activeIntegration===t ? 'bg-blue-600 text-white border-blue-500' : 'bg-gray-800 text-gray-400 border-gray-700 hover:border-gray-500'"
+          class="text-xs px-3 py-1 rounded-lg border transition-colors capitalize">
+          {{ integrationIcons[t] || '🔌' }} {{ integrationLabels[t] || t }}
+        </button>
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs">
+          <thead>
+            <tr class="text-gray-500 border-b border-gray-800">
+              <th class="text-left py-2 pr-4 font-medium w-48">User</th>
+              <th class="text-left py-2 pr-4 font-medium">Integration</th>
+              <th class="text-left py-2 pr-4 font-medium">Portal / Account</th>
+              <th class="text-left py-2 pr-4 font-medium">Group</th>
+              <th class="text-left py-2 pr-4 font-medium">Access Level</th>
+              <th class="text-left py-2 pr-4 font-medium">Status</th>
+              <th class="text-left py-2 pr-4 font-medium">Last Used</th>
+              <th class="text-left py-2 font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template v-for="grp in groupedUsers" :key="grp.account_id">
+              <!-- For each integration under this user -->
+              <template v-for="([intType, intRows], ii) in grp.integrationList" :key="grp.account_id + intType">
+                <tr v-for="(p, pi) in intRows" :key="p.id"
+                  class="border-b border-gray-800/40 hover:bg-gray-800/20"
+                  :class="p.isOverride ? 'bg-yellow-900/5' : ''" >
+                  <!-- User cell: only on very first row of this user (ii===0 && pi===0) -->
+                  <td v-if="ii === 0 && pi === 0"
+                    :rowspan="grp.integrationList.reduce((s,[,r]) => s + r.length, 0)"
+                    class="py-2.5 pr-4 align-top border-t border-gray-700">
+                    <div class="text-gray-200 font-medium">{{ grp.name }}</div>
+                    <div class="text-blue-400 text-[11px]">{{ grp.email }}</div>
+                    <div v-if="grp.position" class="text-gray-600 text-[10px]">{{ grp.position }}</div>
+                  </td>
+                  <!-- Integration cell: once per integration group -->
+                  <td v-if="pi === 0" :rowspan="intRows.length" class="py-2 pr-4 align-middle" :class="ii === 0 ? 'border-t border-gray-700' : ''">
+                    <span class="text-xs font-medium capitalize text-gray-300">{{ integrationIcons[intType] || '🔌' }} {{ integrationLabels[intType] || intType }}</span>
+                  </td>
+                  <td class="py-2 pr-4" :class="ii === 0 && pi === 0 ? 'border-t border-gray-700' : ''">
+                    <span v-if="p.portal_name" class="px-1.5 py-0.5 rounded bg-indigo-900/40 text-indigo-300 border border-indigo-800 text-[10px]">{{ p.portal_name }}</span>
+                    <span v-else class="text-gray-600">—</span>
+                  </td>
+                  <td class="py-2 pr-4" :class="ii === 0 && pi === 0 ? 'border-t border-gray-700' : ''">
+                    <span v-if="p.integration === 'hubspot'" class="text-gray-300">{{ p.positionGroup }}</span>
+                    <span v-else class="text-gray-600">—</span>
+                    <span v-if="p.isOverride" class="ml-1 text-[9px] text-yellow-400 border border-yellow-700 rounded px-1">override</span>
+                  </td>
+                  <td class="py-2 pr-4" :class="ii === 0 && pi === 0 ? 'border-t border-gray-700' : ''"><span :class="[levelBg(p.access_level), 'px-2 py-0.5 rounded border text-[10px] font-mono', levelColor(p.access_level)]">{{ p.access_level }}</span></td>
+                  <td class="py-2 pr-4" :class="ii === 0 && pi === 0 ? 'border-t border-gray-700' : ''"><span :class="p.enabled ? 'text-green-400' : 'text-gray-600'">{{ p.enabled ? 'Active' : 'Disabled' }}</span></td>
+                  <td class="py-2 pr-4 text-gray-500 text-[10px] whitespace-nowrap" :class="ii === 0 && pi === 0 ? 'border-t border-gray-700' : ''">{{ p.last_used_at ? new Date(p.last_used_at).toLocaleDateString() : '—' }}</td>
+                  <td class="py-2" :class="ii === 0 && pi === 0 ? 'border-t border-gray-700' : ''"><button @click="openUserEdit(p)" class="text-[10px] px-2 py-0.5 rounded bg-blue-900/40 hover:bg-blue-800/60 text-blue-300 border border-blue-800/50">Edit</button></td>
+                </tr>
+              </template>
+            </template>
+            <tr v-if="!groupedUsers.length"><td colspan="8" class="py-8 text-center text-gray-600">{{ loading ? 'Loading…' : 'No users found' }}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Group Edit/Create Modal -->
+    <div v-if="groupModal.open" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" @click.self="groupModal.open=false">
+      <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-[480px] shadow-2xl space-y-4">
+        <h2 class="text-sm font-semibold text-white">{{ groupModal.isNew ? 'New Position Group' : 'Edit: ' + groupModal.name }}</h2>
+        <div v-if="groupModal.isNew">
+          <label class="text-gray-500 text-xs block mb-1">Group Name</label>
+          <input v-model="groupModal.name" placeholder="e.g. CS_TeamLeaders" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500" />
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-gray-500 text-xs block mb-1">Access Level</label>
+            <select v-model="groupModal.accessLevel" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+              <option v-for="l in ACCESS_LEVELS" :key="l" :value="l">{{ l }}</option>
+            </select>
+          </div>
+          <div class="flex items-end pb-2">
+            <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+              <input type="checkbox" v-model="groupModal.canWrite" class="accent-blue-500" /> Can Write
+            </label>
+          </div>
+        </div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Portals</label>
+          <div class="flex gap-4">
+            <label v-for="(pname, pid) in PORTAL_NAMES" :key="pid" class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+              <input type="checkbox" :value="pid" v-model="groupModal.portals" class="accent-blue-500" /> {{ pname }}
+            </label>
+          </div>
+        </div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Objects</label>
+          <div class="flex flex-wrap gap-3">
+            <label v-for="obj in ALL_OBJECTS" :key="obj" class="flex items-center gap-1.5 text-xs text-gray-400 cursor-pointer">
+              <input type="checkbox" :value="obj" v-model="groupModal.objects" class="accent-blue-500" /> {{ obj }}
+            </label>
+          </div>
+        </div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Positions <span class="text-gray-600">(comma-separated)</span></label>
+          <textarea v-model="groupModal.positions" rows="2" placeholder="Quality Assurance Analyst, Senior QA Analyst" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500 resize-none" />
+        </div>
+        <div v-if="groupModal.error" class="text-red-400 text-xs">\u274c {{ groupModal.error }}</div>
+        <div class="flex gap-2">
+          <button @click="saveGroup" :disabled="groupModal.saving" class="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium">{{ groupModal.saving ? 'Saving\u2026' : 'Save' }}</button>
+          <button @click="groupModal.open=false" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- User Edit Modal -->
+    <div v-if="userEdit.open" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" @click.self="userEdit.open=false">
+      <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-96 shadow-2xl space-y-4">
+        <h2 class="text-sm font-semibold text-white">Edit Access \u2014 {{ userEdit.row && userEdit.row.name }}</h2>
+        <div class="text-gray-500 text-xs">{{ userEdit.row && userEdit.row.email }} \u00b7 {{ userEdit.row && userEdit.row.portal_name }}</div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Access Level</label>
+          <select v-model="userEdit.access_level" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+            <option v-for="l in ACCESS_LEVELS" :key="l" :value="l">{{ l }}</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Note <span class="text-gray-600">(reason for override)</span></label>
+          <input v-model="userEdit.note" placeholder="e.g. Temporary org access for QA campaign" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500" />
+        </div>
+        <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+          <input type="checkbox" v-model="userEdit.enabled" class="accent-blue-500" /> Enabled
+        </label>
+        <div v-if="userEdit.error" class="text-red-400 text-xs">\u274c {{ userEdit.error }}</div>
+        <div class="flex gap-2">
+          <button @click="saveUserEdit" :disabled="userEdit.saving" class="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium">{{ userEdit.saving ? 'Saving\u2026' : 'Save Override' }}</button>
+          <button @click="userEdit.open=false" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bulk Apply Modal -->
+    <div v-if="bulkModal.open" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" @click.self="bulkModal.open=false">
+      <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-96 shadow-2xl space-y-4">
+        <h2 class="text-sm font-semibold text-white">\u26a1 Bulk Apply \u2014 {{ bulkModal.group && bulkModal.group.name }}</h2>
+        <p class="text-gray-500 text-xs">Updates the group default and applies to all matching users without a manual override.</p>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">New Access Level</label>
+          <select v-model="bulkModal.access_level" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+            <option v-for="l in ACCESS_LEVELS" :key="l" :value="l">{{ l }}</option>
+          </select>
+        </div>
+        <div v-if="bulkModal.result !== null" class="text-green-400 text-xs">\u2713 {{ bulkModal.result }} user(s) updated</div>
+        <div v-if="bulkModal.error" class="text-red-400 text-xs">\u274c {{ bulkModal.error }}</div>
+        <div class="flex gap-2">
+          <button @click="saveBulk" :disabled="bulkModal.saving || bulkModal.result !== null" class="flex-1 py-2 rounded-lg bg-yellow-600 hover:bg-yellow-500 disabled:opacity-40 text-white text-xs font-medium">{{ bulkModal.saving ? 'Applying\u2026' : bulkModal.result !== null ? 'Done' : 'Apply to All' }}</button>
+          <button @click="bulkModal.open=false" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  `,
+};
+
 // ─── Router ───────────────────────────────────────────────────────────────────
 // ─── Reports ──────────────────────────────────────────────────────────────────
 const Reports = {
@@ -4538,6 +5026,7 @@ const routes = [
   { path: '/accounts/:id',  component: AccountProfile },
   { path: '/bindings',      component: Bindings },
   { path: '/skills',        component: Skills },
+  { path: '/integrations',   component: Integrations },
   { path: '/reports',       component: Reports },
   { path: '/settings',      component: Settings },
   { path: '/agents/:slug',  component: AgentProfile },
@@ -4565,6 +5054,7 @@ const App = {
       { path: '/accounts',      label: 'Accounts',      icon: '👤' },
       { path: '/bindings',      label: 'Bindings',      icon: '🔗' },
       { path: '/skills',        label: 'Skills',        icon: '⚡' },
+      { path: '/integrations',   label: 'Integrations',  icon: '🔗' },
       { path: '/settings',      label: 'Settings',      icon: '⚙️' },
     ];
 
@@ -4781,6 +5271,7 @@ const App = {
                       {{ inst.provider || 'anthropic' }}
                     </span>
                     <span class="text-[10px] text-gray-500 font-mono">{{ inst.model || '—' }}</span>
+                    <span v-if="inst.provider === 'ollama'" class="text-[9px] px-1.5 rounded-full bg-orange-900/40 text-orange-400 border border-orange-800/50 font-medium whitespace-nowrap">offline</span>
                   </div>
                 </div>
               </div>

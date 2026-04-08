@@ -145,6 +145,7 @@ start_proxy() {
   lsof -ti :$PROXY_PORT | xargs kill -9 2>/dev/null; sleep 0.5
   # Source .env for API keys
   set -a; [ -f "$(dirname "$PROXY_JS")/../.env" ] && source "$(dirname "$PROXY_JS")/../.env"; set +a
+  export PORT=$PROXY_PORT
   node "$PROXY_JS" > /tmp/fleet-proxy.log 2>&1 &
   echo $! > /tmp/fleet-proxy.pid
   sleep 1

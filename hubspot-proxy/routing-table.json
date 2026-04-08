@@ -40,6 +40,24 @@
         "Marketing QA"
       ],
       "database": false
+    },
+    "BDR": {
+      "accessLevel": "org",
+      "portal": [
+        "4950628"
+      ],
+      "objects": [
+        "contacts",
+        "companies",
+        "deals"
+      ],
+      "positions": [
+        "Business Development Representative",
+        "BDR",
+        "Senior BDR"
+      ],
+      "canWrite": false,
+      "database": false
     }
   },
   "positionGroupOverrides": {},

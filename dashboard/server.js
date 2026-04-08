@@ -2382,6 +2382,82 @@ app.get('/api/sessions/reports', async (req, res) => {
   }
 });
 
+// GET /api/reports/cost-usage — dollar cost per agent per day
+app.get('/api/reports/cost-usage', async (req, res) => {
+  const period = parseInt(req.query.period || '30', 10);
+  try {
+    const r = await pgPool.query(`
+      SELECT a.name as agent_name, DATE(m.created_at) as day,
+             SUM(m.cost_usd) as cost
+      FROM fleet.messages m
+      JOIN fleet.agents a ON a.id = m.agent_id
+      WHERE m.created_at >= now() - make_interval(days => $1)
+        AND m.cost_usd > 0 AND m.role = 'assistant'
+        AND a.org_id = $2
+      GROUP BY a.name, DATE(m.created_at)
+      ORDER BY day, a.name`, [period, ORG_ID]);
+    const days = [];
+    const now = new Date();
+    for (let i = period - 1; i >= 0; i--) {
+      const d = new Date(now); d.setDate(d.getDate() - i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+    const agents = [...new Set(r.rows.map(row => row.agent_name))].sort();
+    const series = agents.map(agent => ({
+      agent,
+      data: days.map(day => {
+        const row = r.rows.find(r => r.agent_name === agent && r.day.toISOString().slice(0,10) === day);
+        return { day, cost: row ? parseFloat(row.cost) : 0 };
+      })
+    }));
+    res.json({ days, agents, series, period });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/reports/context-usage — token usage per agent per day
+app.get('/api/reports/context-usage', async (req, res) => {
+  const period = parseInt(req.query.period || '30', 10);
+  try {
+    const r = await pgPool.query(`
+      SELECT a.name as agent_name, a.slug,
+             DATE(m.created_at) as day,
+             SUM(m.total_tokens) as tokens,
+             SUM(m.input_tokens) as input_tokens,
+             SUM(m.output_tokens) as output_tokens,
+             COUNT(*) as messages
+      FROM fleet.messages m
+      JOIN fleet.agents a ON a.id = m.agent_id
+      WHERE m.created_at >= now() - make_interval(days => $1)
+        AND m.total_tokens > 0
+        AND m.role = 'assistant'
+        AND a.org_id = $2
+      GROUP BY a.name, a.slug, DATE(m.created_at)
+      ORDER BY day, a.name`, [period, ORG_ID]);
+
+    // Build date range
+    const days = [];
+    const now = new Date();
+    for (let i = period - 1; i >= 0; i--) {
+      const d = new Date(now); d.setDate(d.getDate() - i);
+      days.push(d.toISOString().slice(0, 10));
+    }
+
+    // Get unique agents
+    const agents = [...new Set(r.rows.map(row => row.agent_name))].sort();
+
+    // Build series: one per agent, one value per day
+    const series = agents.map(agent => ({
+      agent,
+      data: days.map(day => {
+        const row = r.rows.find(r => r.agent_name === agent && r.day.toISOString().slice(0,10) === day);
+        return { day, tokens: row ? parseInt(row.tokens) : 0, messages: row ? parseInt(row.messages) : 0 };
+      })
+    }));
+
+    res.json({ days, agents, series, period });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // GET /api/reports/cost — cost & token analysis report
 // Query params: period=7|30|90 (days), agent_id (optional)
 app.get('/api/reports/cost', async (req, res) => {

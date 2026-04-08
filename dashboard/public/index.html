@@ -8,6 +8,7 @@
   <script src="https://cdn.jsdelivr.net/npm/vue-router@4/dist/vue-router.global.prod.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/highlight.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11/build/styles/github-dark.min.css">
   <style>
@@ -4844,39 +4845,81 @@ const Integrations = {
 // ─── Reports ──────────────────────────────────────────────────────────────────
 const Reports = {
   setup() {
-    const { ref, computed, onMounted } = Vue;
+    const { ref, computed, onMounted, nextTick } = Vue;
     const heatmap = ref([]);
     const stats = ref(null);
     const loading = ref(true);
     const error = ref('');
+    const contextUsage = ref(null);
+    const costUsage = ref(null);
+    const chartPeriod = ref(30);
+    let tokenChart = null, costChart = null;
 
-    const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-
+    const DAYS = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
     function buildGrid(rows) {
-      const map = {};
-      let max = 0;
-      for (const r of rows) {
-        map[`${r.day_of_week}-${r.hour}`] = r.message_count;
-        if (r.message_count > max) max = r.message_count;
-      }
+      const map = {}; let max = 0;
+      for (const r of rows) { map[r.day_of_week+'-'+r.hour] = r.message_count; if (r.message_count > max) max = r.message_count; }
       const grid = [];
       for (let d = 0; d < 7; d++) {
         const cells = [];
-        for (let h = 0; h < 24; h++) {
-          const v = map[`${d}-${h}`] || 0;
-          cells.push({ hour: h, value: v, intensity: max ? v / max : 0 });
-        }
+        for (let h = 0; h < 24; h++) { const v = map[d+'-'+h]||0; cells.push({ hour: h, value: v, intensity: max ? v/max : 0 }); }
         grid.push({ day: DAYS[d], cells });
       }
       return { rows: grid, max };
     }
-
     const currentGrid = computed(() => buildGrid(heatmap.value.filter(r => r.week === 'current')));
     const previousGrid = computed(() => buildGrid(heatmap.value.filter(r => r.week === 'previous')));
+    function cellColor(intensity) { if (!intensity) return '#1f2937'; return 'rgba(59,130,246,'+(0.15+intensity*0.85).toFixed(2)+')'; }
 
-    function cellColor(intensity) {
-      if (intensity === 0) return '#1f2937';
-      return `rgba(59,130,246,${(0.15 + intensity * 0.85).toFixed(2)})`;
+    const AGENT_COLORS = ["#3b82f6","#10b981","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#f97316","#ec4899","#84cc16","#6366f1"];
+
+    function buildChartDatasets(usageData, valueKey) {
+      if (!usageData) return { labels: [], datasets: [] };
+      return {
+        labels: usageData.days.map(d => d.slice(5)),
+        datasets: usageData.series.map((s, i) => ({
+          label: s.agent,
+          data: s.data.map(pt => pt[valueKey] || 0),
+          borderColor: AGENT_COLORS[i % AGENT_COLORS.length],
+          backgroundColor: AGENT_COLORS[i % AGENT_COLORS.length] + "33",
+          borderWidth: 2, pointRadius: 3, pointHoverRadius: 6,
+          tension: 0.3, fill: false
+        }))
+      };
+    }
+
+    const CHART_OPTS = (yLabel, fmt) => ({
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { labels: { color: "#9ca3af", boxWidth: 12, font: { size: 11 } } },
+        tooltip: {
+          backgroundColor: "#1f2937", borderColor: "#374151", borderWidth: 1,
+          titleColor: "#f9fafb", bodyColor: "#d1d5db",
+          callbacks: { label: ctx => " " + ctx.dataset.label + ": " + fmt(ctx.parsed.y) }
+        }
+      },
+      scales: {
+        x: { ticks: { color: "#6b7280", font: { size: 10 } }, grid: { color: "#1f2937" } },
+        y: { ticks: { color: "#6b7280", font: { size: 10 }, callback: v => fmt(v) }, grid: { color: "#374151" } }
+      }
+    });
+
+    function fmtTokens(n) { if(n>=1e6) return (n/1e6).toFixed(1)+"M"; if(n>=1000) return (n/1000).toFixed(0)+"K"; return String(Math.round(n)); }
+    function fmtCost(n) { return "$"+(n||0).toFixed(3); }
+
+    async function loadCharts() {
+      const [cr, dr] = await Promise.all([
+        fetch("/api/reports/context-usage?period="+chartPeriod.value).then(r=>r.ok?r.json():null).catch(()=>null),
+        fetch("/api/reports/cost-usage?period="+chartPeriod.value).then(r=>r.ok?r.json():null).catch(()=>null),
+      ]);
+      contextUsage.value = cr;
+      costUsage.value = dr;
+      await nextTick();
+      const tokenEl = document.getElementById("tokenChart");
+      if (tokenEl && cr) { if (tokenChart) tokenChart.destroy(); tokenChart = new Chart(tokenEl, { type: "line", data: buildChartDatasets(cr, "tokens"), options: CHART_OPTS("Tokens", fmtTokens) }); }
+      const costEl = document.getElementById("costChart");
+      if (costEl && dr) { if (costChart) costChart.destroy(); costChart = new Chart(costEl, { type: "line", data: buildChartDatasets(dr, "cost"), options: CHART_OPTS("Cost", fmtCost) }); }
     }
 
     onMounted(async () => {
@@ -4885,18 +4928,15 @@ const Reports = {
           fetch('/api/reports/session-heatmap'),
           fetch('/api/reports/session-stats'),
         ]);
-        if (hRes.status === 'fulfilled' && hRes.value.ok) {
-          const d = await hRes.value.json();
-          heatmap.value = d.heatmap || [];
-        }
-        if (sRes.status === 'fulfilled' && sRes.value.ok) {
-          stats.value = await sRes.value.json();
-        }
+        if (hRes.status === 'fulfilled' && hRes.value.ok) { const d = await hRes.value.json(); heatmap.value = d.heatmap || []; }
+        if (sRes.status === 'fulfilled' && sRes.value.ok) { stats.value = await sRes.value.json(); }
       } catch (e) { error.value = e.message; }
       loading.value = false;
+      await loadCharts();
     });
 
-    return { loading, error, currentGrid, previousGrid, stats, cellColor, DAYS };
+    return { loading, error, currentGrid, previousGrid, stats, cellColor, DAYS, chartPeriod, loadCharts,
+             agentBarWidth: (a,top) => { const v=parseInt(a.total||a.session_count||a.count||0); const m=parseInt((top&&(top.total||top.session_count||top.count))||1); return m?(v/m*100)+"%":"0%"; } };
   },
   template: `
     <div class="p-6">
@@ -4998,17 +5038,36 @@ const Reports = {
         <div v-if="stats && stats.by_agent && stats.by_agent.length" class="bg-gray-900 border border-gray-800 rounded-xl p-5">
           <h2 class="text-sm font-semibold text-gray-300 mb-4">Sessions by Agent</h2>
           <div class="space-y-2">
-            <div v-for="a in stats.by_agent" :key="a.agent_name" class="flex items-center gap-3">
-              <span class="text-gray-400 text-xs w-32 truncate">{{ a.agent_name || 'Unknown' }}</span>
+            <div v-for="a in stats.by_agent" :key="a.agent || a.agent_name" class="flex items-center gap-3">
+              <span class="text-gray-400 text-xs w-32 truncate">{{ a.agent || a.agent_name || 'Unknown' }}</span>
               <div class="flex-1 bg-gray-800 rounded-full h-1.5 overflow-hidden">
                 <div class="h-full bg-blue-500 rounded-full"
-                     :style="{ width: (stats.by_agent[0]?.count ? (a.count/stats.by_agent[0].count*100) : 0)+'%' }"></div>
+                     :style="{ width: agentBarWidth(a, stats.by_agent[0]) }"></div>
               </div>
-              <span class="text-gray-500 text-xs w-8 text-right">{{ a.count }}</span>
+              <span class="text-gray-500 text-xs w-8 text-right">{{ a.total || a.session_count || a.count }}</span>
             </div>
           </div>
         </div>
-      </div>
+
+        <!-- Token Usage Chart -->
+        <div class="mt-8 bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-sm font-semibold text-gray-300">Context Usage by Agent <span class="text-gray-600 text-xs font-normal">(tokens/day)</span></h2>
+            <div class="flex gap-1.5">
+              <button v-for="pd in [7,14,30,90]" :key="pd" @click="chartPeriod=pd; loadCharts()"
+                :class="chartPeriod===pd ? 'bg-blue-600 text-white' : 'bg-gray-800 text-gray-400 hover:text-white'"
+                class="text-xs px-2.5 py-1 rounded-lg transition-colors">{{ pd }}d</button>
+            </div>
+          </div>
+          <div class="relative" style="height:220px"><canvas id="tokenChart"></canvas></div>
+        </div>
+        <!-- Cost Usage Chart -->
+        <div class="mt-6 bg-gray-900 border border-gray-800 rounded-xl p-5">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-sm font-semibold text-gray-300">Cost by Agent <span class="text-gray-600 text-xs font-normal">(USD/day)</span></h2>
+          </div>
+          <div class="relative" style="height:220px"><canvas id="costChart"></canvas></div>
+        </div>
     </div>
   `,
 };

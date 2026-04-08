@@ -131,6 +131,7 @@ async function resolveOwner(email, token) {
 function resolvePositionGroupFromRoles(roles, position) {
   if (roles.includes('system_developer') || roles.includes('it_admin')) return 'Dev_IT';
   if (roles.includes('quality_analyst') || roles.includes('qa_user') || roles.includes('marketing qa') || roles.includes('memo_qa_access')) return 'QA';
+  if (roles.includes('bdr') || roles.includes('business_development_representative')) return 'BDR';
   if (roles.includes('finance')) return 'Finance';
   if (roles.includes('executive') || roles.includes('exec')) return 'Executive';
   if (roles.includes('manager')) return 'Manager';
@@ -146,12 +147,14 @@ function resolvePositionGroupFromRoles(roles, position) {
 function resolveAllowedObjectsFromRoles(roles, accessLevel) {
   if (roles.includes('system_developer') || roles.includes('it_admin')) return ['contacts', 'companies', 'deals', 'owners', '2-20106951'];
   if (roles.includes('quality_analyst') || roles.includes('qa_user') || roles.includes('marketing qa') || roles.includes('memo_qa_access')) return ['contacts', 'companies', 'deals'];
+  if (roles.includes('bdr') || roles.includes('business_development_representative')) return ['contacts', 'companies', 'deals'];
   return ['contacts', 'companies', 'deals'];
 }
 
 function resolveCanWriteFromRoles(roles, accessLevel) {
   if (roles.includes('system_developer') || roles.includes('it_admin') || roles.includes('finance') || roles.includes('executive')) return true;
   if (roles.includes('quality_analyst') || roles.includes('qa_user') || roles.includes('marketing qa') || roles.includes('memo_qa_access')) return false;
+  if (roles.includes('bdr') || roles.includes('business_development_representative')) return false;
   return accessLevel === 'org' || accessLevel === 'admin';
 }
 
@@ -381,7 +384,7 @@ app.get('/identity/:email', async (req, res) => {
 
 app.post('/query', async (req, res) => {
   try {
-    const { email, portal_id, object, filters, properties, limit, countOnly, dateFilter, department, record_id } = req.body;
+    const { email, portal_id, object, filters, properties, limit, countOnly, dateFilter, department, record_id, withAssociations } = req.body;
     if (!email || !portal_id || !object) return res.status(400).json({ error: 'email, portal_id, and object are required' });
 
     const identity = await resolveIdentity(email, portal_id);
@@ -442,8 +445,55 @@ app.post('/query', async (req, res) => {
     const hsResp = await axios.post(`${HUBSPOT_API}/crm/v3/objects/${object}/search`, searchBody, { headers: { Authorization: `Bearer ${apiToken}` } });
 
     const total = hsResp.data.total ?? 0;
-    const results = countOnly ? [] : (hsResp.data.results || []);
+    let results = countOnly ? [] : (hsResp.data.results || []);
     const filtersApplied = filterGroups.flatMap(fg => fg.filters);
+
+    // Auto-enrich deals with associated contacts when withAssociations=true or object is deals
+    const shouldEnrich = !countOnly && (withAssociations === true || (withAssociations !== false && object === 'deals'));
+    if (shouldEnrich && results.length > 0) {
+      try {
+        const CONTACT_PROPS = ['email','firstname','lastname','phone','jobtitle','company','lifecyclestage','hs_lead_status'];
+        const dealIds = results.map(r => r.id);
+
+        // Step 1: batch read deals with associations to get contact IDs inline
+        const dealBatchResp = await axios.post(
+          `${HUBSPOT_API}/crm/v3/objects/deals/batch/read`,
+          { inputs: dealIds.map(id => ({ id })), properties: [], associations: ['contacts'] },
+          { headers: { Authorization: `Bearer ${apiToken}` } }
+        ).catch(() => null);
+
+        if (dealBatchResp?.data?.results?.length) {
+          // Build map: dealId -> [contactIds]
+          const dealContactMap = {};
+          for (const deal of dealBatchResp.data.results) {
+            const contactAssocs = deal.associations?.contacts?.results || [];
+            dealContactMap[deal.id] = contactAssocs.map(a => a.id);
+          }
+
+          // Step 2: collect all unique contact IDs and batch read
+          const allContactIds = [...new Set(Object.values(dealContactMap).flat())];
+          if (allContactIds.length > 0) {
+            const contactResp = await axios.post(
+              `${HUBSPOT_API}/crm/v3/objects/contacts/batch/read`,
+              { inputs: allContactIds.map(id => ({ id })), properties: CONTACT_PROPS },
+              { headers: { Authorization: `Bearer ${apiToken}` } }
+            ).catch(() => null);
+
+            if (contactResp?.data?.results?.length) {
+              const contactMap = {};
+              for (const c of contactResp.data.results) contactMap[c.id] = c;
+              results = results.map(deal => ({
+                ...deal,
+                associated_contacts: (dealContactMap[deal.id] || []).map(cid => contactMap[cid]).filter(Boolean)
+              }));
+            }
+          }
+        }
+      } catch (enrichErr) {
+        console.error('[query] Association enrichment failed:', enrichErr.message);
+        // Non-fatal — return results without enrichment
+      }
+    }
 
     auditLog({ email, accessLevel: effectiveLevel, portal: portal_id, object, countOnly: !!countOnly, filtersApplied, resultCount: total });
 

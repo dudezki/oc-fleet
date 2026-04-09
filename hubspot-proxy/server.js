@@ -715,7 +715,8 @@ function deduplicateRecords(records) {
 
 app.post('/query/dynamic-list', async (req, res) => {
   try {
-    const { email, portal_id, campaign_name, icp_filters = {}, countOnly = false, dry_run = false } = req.body;
+    const { email, portal_id, campaign_name, icp_filters = {}, countOnly = false, dry_run = false, mode = 'fresh', deal_id = null } = req.body;
+    // mode: 'fresh' (default) = static list creation | 'live' = convert ICP to HubSpot active list + update deal properties
 
     if (!email || !campaign_name) return res.status(400).json({ error: 'email and campaign_name are required' });
     if (!icp_filters.country?.length && !icp_filters.industry?.length && !icp_filters.job_title_keywords?.length) {
@@ -788,6 +789,68 @@ app.post('/query/dynamic-list', async (req, res) => {
       });
     }
 
+    // ── LIVE MODE: HubSpot Active List + update deal properties ──
+    if (mode === 'live') {
+      // Step 1: Find deal by campaign_name
+      let resolvedDealId = deal_id;
+      if (!resolvedDealId) {
+        const dealSearch = await axios.post(`${HUBSPOT_API}/crm/v3/objects/deals/search`, {
+          filterGroups: [{ filters: [{ propertyName: 'dealname', operator: 'CONTAINS_TOKEN', value: campaign_name }] }],
+          properties: ['dealname', 'hs_object_id'], limit: 10
+        }, { headers: { Authorization: `Bearer ${apiToken}` } }).catch(() => null);
+        const dealResults = dealSearch?.data?.results || [];
+        if (dealResults.length === 0)
+          return res.status(400).json({ error: `No deals found matching "${campaign_name}". Please provide a deal_id or deal link.`, code: 'DEAL_NOT_FOUND' });
+        if (dealResults.length > 1)
+          return res.status(400).json({ error: `Multiple deals (${dealResults.length}) match "${campaign_name}". Which one?`, code: 'DEAL_AMBIGUOUS', deals: dealResults.map(d => ({ id: d.id, name: d.properties?.dealname })) });
+        resolvedDealId = dealResults[0].id;
+      }
+
+      // Step 2: Convert ICP to HubSpot filter format
+      const icpFiltersArr = [];
+      if (icp_filters.country?.length) icpFiltersArr.push({ propertyName: 'country', operator: 'IN', values: icp_filters.country });
+      if (icp_filters.state?.length) icpFiltersArr.push({ propertyName: 'state', operator: 'IN', values: icp_filters.state });
+      if (icp_filters.industry?.length) icpFiltersArr.push({ propertyName: 'industry', operator: 'IN', values: icp_filters.industry });
+      if (icp_filters.job_title_keywords?.length) icpFiltersArr.push({ propertyName: 'job_title', operator: 'CONTAINS_TOKEN', value: icp_filters.job_title_keywords.join(' OR ') });
+      const icpJson = JSON.stringify({ filterGroups: [{ filters: icpFiltersArr }] });
+
+      // Step 3: Create HubSpot Active (DYNAMIC) list
+      const liveListName = `CS Dynamic List - ${campaign_name}`;
+      const listResp = await axios.post(`${HUBSPOT_API}/crm/v3/lists`, {
+        name: liveListName, objectTypeId: '2-20106951', processingType: 'DYNAMIC',
+        filterBranch: {
+          filterBranchType: 'AND',
+          filters: icpFiltersArr.map(f => ({
+            filterType: 'PROPERTY', property: f.propertyName,
+            operation: { operationType: 'MULTISTRING', includeObjectsWithNoValueSet: false, values: f.values || [f.value] }
+          })),
+          filterBranches: []
+        }
+      }, { headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' } }).catch(e => ({ data: e.response?.data }));
+      const listId = listResp?.data?.list?.listId || listResp?.data?.listId || null;
+
+      // Step 4: Update deal with ICP + enrolment property
+      await axios.patch(`${HUBSPOT_API}/crm/v3/objects/deals/${resolvedDealId}`, {
+        properties: {
+          dynamic_list_icp: icpJson,
+          dynamic_list_enrolment: `CS Dynamic List - ${campaign_name}`
+        }
+      }, { headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' } })
+        .catch(err => console.error('[dynamic-list/live] Deal update failed:', err.message));
+
+      auditLog({ email, accessLevel: identity.accessLevel, portal: portalId, object: '2-20106951', action: 'dynamic-list-live', campaign_name, resultCount: finalRecords.length });
+
+      return res.json({
+        success: true, mode: 'live', campaign_name,
+        list_name: liveListName, list_id: listId,
+        list_url: listId ? `https://app.hubapi.com/contacts/${portalId}/objectLists/${listId}` : null,
+        deal_id: resolvedDealId, icp_applied: icpFiltersArr,
+        caller: { email: identity.email, positionGroup: identity.positionGroup },
+        summary: { total_matched: finalRecords.length, tier1_count: Math.min(t1.results?.length || 0, finalRecords.length), tier2_count: Math.min(t2.results?.length || 0, finalRecords.length), tier3_used: tier3Used },
+      });
+    }
+
+    // ── FRESH MODE (default): static list + stamp records ──
     const listResp = await axios.post(`${HUBSPOT_API}/crm/v3/lists`, { name: listName, objectTypeId: '2-20106951', processingType: 'MANUAL' }, { headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' } });
     const listId = listResp.data?.list?.listId;
 
@@ -1072,6 +1135,122 @@ app.post('/qualify', async (req, res) => {
     console.error('[qualify] Error:', err.message);
     res.status(500).json({ error: err.response?.data || err.message });
   }
+});
+
+// ── SEMrush Routes ─────────────────────────────────────────────────────────
+
+const SEMRUSH_API = 'https://api.semrush.com';
+
+function parseSemrushCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length < 2) return [];
+  const headers = lines[0].split(';');
+  return lines.slice(1).map(line => {
+    const vals = line.split(';');
+    const obj = {};
+    headers.forEach((h, i) => { obj[h.trim()] = vals[i]?.trim(); });
+    return obj;
+  });
+}
+
+async function getSemrushKey(email) {
+  const r = await dbPool.query(
+    `SELECT ui.credentials, ui.enabled FROM fleet.user_integrations ui
+     JOIN fleet.accounts a ON a.id = ui.account_id
+     WHERE a.email = $1 AND ui.integration = 'semrush' AND ui.enabled = true LIMIT 1`,
+    [email]
+  );
+  if (!r.rows.length) return null;
+  return r.rows[0].credentials?.api_key || process.env.SEMRUSH_API_KEY_MARKETING || null;
+}
+
+function checkSemrushError(text, res) {
+  if (typeof text !== 'string') return false;
+  if (text.includes('ERROR 132')) {
+    res.status(402).json({ error: 'SEMrush API credits exhausted. Please top up the account.', code: 'SEMRUSH_NO_CREDITS' });
+    return true;
+  }
+  if (text.startsWith('ERROR')) {
+    res.status(500).json({ error: text.trim() });
+    return true;
+  }
+  return false;
+}
+
+async function semrushGet(params, res) {
+  try {
+    const resp = await axios.get(`${SEMRUSH_API}/`, { params, validateStatus: () => true });
+    const text = typeof resp.data === 'string' ? resp.data : JSON.stringify(resp.data);
+    if (text.includes('ERROR 132')) { res.status(402).json({ error: 'SEMrush API credits exhausted. Please top up the account.', code: 'SEMRUSH_NO_CREDITS' }); return null; }
+    if (text.startsWith('ERROR')) { res.status(500).json({ error: text.trim() }); return null; }
+    return text;
+  } catch(e) { res.status(500).json({ error: e.message }); return null; }
+}
+
+app.post('/semrush/domain/overview', async (req, res) => {
+  try {
+    const { email, domain, database = 'us' } = req.body;
+    if (!email || !domain) return res.status(400).json({ error: 'email and domain required' });
+    const key = await getSemrushKey(email);
+    if (!key) return res.status(403).json({ error: 'No SEMrush access for this user', code: 'SEMRUSH_NO_ACCESS' });
+    const text = await semrushGet({ type: 'domain_ranks', key, export_columns: 'Dn,Rk,Or,Ot,Oc,Ad,At,Ac', domain, database }, res);
+    if (!text) return;
+    const rows = parseSemrushCSV(text); const r = rows[0] || {};
+    res.json({ domain: r.Domain||domain, rank: r.Rank, organic_keywords: r['Organic Keywords'], organic_traffic: r['Organic Traffic'], organic_cost: r['Organic Cost'], adwords_keywords: r['Adwords Keywords'], adwords_traffic: r['Adwords Traffic'], adwords_cost: r['Adwords Cost'] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/semrush/keyword/research', async (req, res) => {
+  try {
+    const { email, keyword, database = 'us' } = req.body;
+    if (!email || !keyword) return res.status(400).json({ error: 'email and keyword required' });
+    const key = await getSemrushKey(email);
+    if (!key) return res.status(403).json({ error: 'No SEMrush access for this user', code: 'SEMRUSH_NO_ACCESS' });
+    const text = await semrushGet({ type: 'phrase_this', key, export_columns: 'Ph,Nq,Cp,Co,Nr,Td', phrase: keyword, database }, res);
+    if (!text) return;
+    const rows = parseSemrushCSV(text); const r = rows[0] || {};
+    res.json({ keyword: r.Keyword||keyword, search_volume: r['Search Volume'], cpc: r.CPC, competition: r['Competition Density'], results: r['Number of Results'], trend: r.Trends });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/semrush/competitor/analysis', async (req, res) => {
+  try {
+    const { email, domain, database = 'us' } = req.body;
+    if (!email || !domain) return res.status(400).json({ error: 'email and domain required' });
+    const key = await getSemrushKey(email);
+    if (!key) return res.status(403).json({ error: 'No SEMrush access for this user', code: 'SEMRUSH_NO_ACCESS' });
+    const text = await semrushGet({ type: 'domain_organic_organic', key, export_columns: 'Dn,Np,Or,Ot,Oc,Ad', domain, database, display_limit: 10 }, res);
+    if (!text) return;
+    const rows = parseSemrushCSV(text);
+    res.json({ domain, competitors: rows.map(r => ({ domain: r.Domain, common_keywords: r['Common Keywords'], organic_keywords: r['Organic Keywords'], organic_traffic: r['Organic Traffic'], organic_cost: r['Organic Cost'], adwords_keywords: r['Adwords Keywords'] })) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/semrush/backlinks', async (req, res) => {
+  try {
+    const { email, domain } = req.body;
+    if (!email || !domain) return res.status(400).json({ error: 'email and domain required' });
+    const key = await getSemrushKey(email);
+    if (!key) return res.status(403).json({ error: 'No SEMrush access for this user', code: 'SEMRUSH_NO_ACCESS' });
+    const text = await semrushGet({ type: 'backlinks_overview', key, target: domain, target_type: 'root_domain', export_columns: 'ascore,total,domains_num,urls_num,ips_num,ipclassc_num,follows_num,nofollows_num' }, res);
+    if (!text) return;
+    const rows = parseSemrushCSV(text); const r = rows[0] || {};
+    res.json({ domain, authority_score: r['Authority Score'], total_backlinks: r['Total Backlinks'], referring_domains: r['Domains'], referring_urls: r['URLs'], referring_ips: r['IPs'], referring_ipclass_c: r['IPs (Class C)'], dofollow: r['Follow'], nofollow: r['NoFollow'] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/semrush/keyword/bulk', async (req, res) => {
+  try {
+    const { email, keywords, database = 'us' } = req.body;
+    if (!email || !keywords?.length) return res.status(400).json({ error: 'email and keywords[] required' });
+    if (keywords.length > 100) return res.status(400).json({ error: 'Max 100 keywords per request' });
+    const key = await getSemrushKey(email);
+    if (!key) return res.status(403).json({ error: 'No SEMrush access for this user', code: 'SEMRUSH_NO_ACCESS' });
+    const text = await semrushGet({ type: 'phrase_these', key, export_columns: 'Ph,Nq,Cp,Co,Nr', phrase: keywords.join(';'), database }, res);
+    if (!text) return;
+    const rows = parseSemrushCSV(text);
+    res.json({ results: rows.map(r => ({ keyword: r.Keyword, search_volume: r['Search Volume'], cpc: r.CPC, competition: r['Competition Density'], results: r['Number of Results'] })) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.listen(PORT, '127.0.0.1', () => {

@@ -10,9 +10,9 @@ export PATH="/usr/bin:$PATH"
 cmd="${1:-status}"
 target="${2:-all}"
 
-port_for()   { case $1 in sales) echo 20010;; support) echo 20020;; manager) echo 20030;; dev) echo 20040;; it) echo 20050;; hr) echo 20060;; finance) echo 20070;; security) echo 20080;; documentor) echo 20090;; esac; }
+port_for()   { case $1 in sales) echo 20010;; support) echo 20020;; manager) echo 20030;; dev) echo 20040;; it) echo 20050;; hr) echo 20060;; finance) echo 20070;; security) echo 20080;; documentor) echo 20090;; marketing) echo 20085;; esac; }
 home_for()   { echo "$HOME/cbfleet-rag-$1"; }
-instances()  { [ "$target" = "all" ] && echo "sales support manager dev it hr finance security documentor" || echo "$target"; }
+instances()  { [ "$target" = "all" ] && echo "sales support manager dev it hr finance security documentor marketing" || echo "$target"; }
 
 PROXY_PORT=20000
 PROXY_JS=/home/dev-user/Projects/oc-fleet/proxy/server.js
@@ -191,7 +191,7 @@ stop_instance() {
 
 status_all() {
   echo "=== Fleet Status ==="
-  for inst in sales support manager dev it hr finance security documentor; do
+  for inst in sales support manager dev it hr finance security documentor marketing; do
     local port r
     port=$(port_for "$inst")
     r=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$port/health 2>/dev/null)

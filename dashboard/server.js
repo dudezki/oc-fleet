@@ -2639,7 +2639,7 @@ app.get('/api/integrations/users', async (req, res) => {
     const filterIntegration = req.query.integration || null;
     const r = await pgPool.query(`
       SELECT ui.id, ui.account_id, ui.integration, ui.portal_id, ui.access_level, ui.enabled,
-             ui.meta, ui.scopes, ui.note, ui.updated_at, ui.last_used_at,
+             ui.meta, ui.credentials, ui.scopes, ui.note, ui.updated_at, ui.last_used_at,
              a.name, a.email, a.department, a.role
       FROM fleet.user_integrations ui
       JOIN fleet.accounts a ON a.id = ui.account_id
@@ -2670,6 +2670,7 @@ app.get('/api/integrations/users', async (req, res) => {
         access_level: row.access_level, enabled: row.enabled,
         name: row.name, email: row.email, department: row.department, role: row.role,
         position: pos, roles, positionGroup, isOverride, note: row.note,
+        has_api_key: !!(row.credentials?.api_key),
         last_used_at: row.last_used_at, updated_at: row.updated_at
       };
     });
@@ -2677,10 +2678,30 @@ app.get('/api/integrations/users', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/integrations/users/add — add a user to an integration
+app.post('/api/integrations/users/add', async (req, res) => {
+  try {
+    const { integration, email, access_level = 'org', api_key, portal_id = null } = req.body;
+    if (!integration || !email) return res.status(400).json({ error: 'integration and email required' });
+    const acct = await pgPool.query(`SELECT id FROM fleet.accounts WHERE email=$1 AND org_id=$2`, [email, ORG_ID]);
+    if (!acct.rows.length) return res.status(404).json({ error: `No account found for ${email}` });
+    const credentials = api_key ? JSON.stringify({ api_key }) : '{}';
+    const meta = JSON.stringify({ team: integration });
+    await pgPool.query(
+      `INSERT INTO fleet.user_integrations (org_id, account_id, integration, portal_id, access_level, enabled, credentials, meta)
+       VALUES ($1,$2,$3,$4,$5,true,$6::jsonb,$7::jsonb)
+       ON CONFLICT (org_id, account_id, integration, portal_id) DO UPDATE
+         SET access_level=$5, enabled=true, credentials=EXCLUDED.credentials, updated_at=now()`,
+      [ORG_ID, acct.rows[0].id, integration, portal_id, access_level, credentials, meta]
+    );
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // PATCH /api/integrations/users/:id — update access_level, canWrite, enabled for one user_integration row
 app.patch('/api/integrations/users/:id', async (req, res) => {
   try {
-    const { access_level, enabled, note, roles } = req.body;
+    const { access_level, enabled, note, roles, api_key } = req.body;
     const sets = [];
     const vals = [];
     let i = 1;
@@ -2690,6 +2711,10 @@ app.patch('/api/integrations/users/:id', async (req, res) => {
     if (roles !== undefined) {
       sets.push(`meta = meta || jsonb_build_object('roles', $${i++}::jsonb, 'access_override', true)`);
       vals.push(JSON.stringify(roles));
+    }
+    if (api_key !== undefined) {
+      sets.push(`credentials = credentials || jsonb_build_object('api_key', $${i++})`);
+      vals.push(api_key);
     }
     if (!sets.length) return res.status(400).json({ error: 'Nothing to update' });
     sets.push(`updated_at=now()`);

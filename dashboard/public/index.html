@@ -4502,7 +4502,8 @@ const Integrations = {
     const showOverridesOnly = ref(false);
     const activeIntegration = ref('all');
     const groupModal = reactive({ open: false, isNew: false, name: '', accessLevel: 'owner', canWrite: false, portals: [], objects: ['contacts','companies','deals'], positions: '', saving: false, error: '' });
-    const userEdit = reactive({ open: false, row: null, access_level: '', enabled: true, note: '', saving: false, error: '' });
+    const userEdit = reactive({ open: false, row: null, access_level: '', enabled: true, note: '', api_key: '', saving: false, error: '' });
+    const addUser = reactive({ open: false, integration: 'semrush', email: '', access_level: 'org', api_key: '', saving: false, error: '' });
     const bulkModal = reactive({ open: false, group: null, access_level: '', saving: false, result: null, error: '' });
 
     async function load() {
@@ -4521,8 +4522,8 @@ const Integrations = {
       return types;
     });
 
-    const integrationIcons = { hubspot: '🟠', google: '🔵', slack: '💬', github: '🐙' };
-    const integrationLabels = { hubspot: 'HubSpot', google: 'Google', slack: 'Slack', github: 'GitHub' };
+    const integrationIcons = { hubspot: '🟠', google: '🔵', slack: '💬', github: '🐙', semrush: '🔍', gtmetrix: '⚡' };
+    const integrationLabels = { hubspot: 'HubSpot', google: 'Google', slack: 'Slack', github: 'GitHub', semrush: 'SEMrush', gtmetrix: 'GTmetrix' };
     onMounted(load);
 
     const groupCounts = computed(() => {
@@ -4584,11 +4585,13 @@ const Integrations = {
       await load();
     }
     function openUserEdit(row) {
-      Object.assign(userEdit, { open: true, row, access_level: row.access_level, enabled: row.enabled, note: row.note || '', saving: false, error: '' });
+      Object.assign(userEdit, { open: true, row, access_level: row.access_level, enabled: row.enabled, note: row.note || '', api_key: '', saving: false, error: '' });
     }
     async function saveUserEdit() {
       userEdit.saving = true; userEdit.error = '';
-      const r = await fetch('/api/integrations/users/' + userEdit.row.id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ access_level: userEdit.access_level, enabled: userEdit.enabled, note: userEdit.note }) });
+      const body = { access_level: userEdit.access_level, enabled: userEdit.enabled, note: userEdit.note };
+      if (userEdit.api_key) body.api_key = userEdit.api_key;
+      const r = await fetch('/api/integrations/users/' + userEdit.row.id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
       const d = await r.json();
       if (d.success) { userEdit.open = false; await load(); }
       else userEdit.error = d.error || 'Failed';
@@ -4609,11 +4612,26 @@ const Integrations = {
     const levelColor = l => ({ org:'text-green-400', admin:'text-purple-400', team:'text-blue-400', owner:'text-gray-400', standard:'text-gray-500' }[l]||'text-gray-500');
     const levelBg   = l => ({ org:'bg-green-900/30 border-green-800', admin:'bg-purple-900/30 border-purple-800', team:'bg-blue-900/30 border-blue-800', owner:'bg-gray-800 border-gray-700', standard:'bg-gray-800 border-gray-700' }[l]||'bg-gray-800 border-gray-700');
 
+    function openAddUser() {
+      Object.assign(addUser, { open: true, integration: activeIntegration.value === 'all' ? 'semrush' : activeIntegration.value, email: '', access_level: 'org', api_key: '', saving: false, error: '' });
+    }
+    async function saveAddUser() {
+      addUser.saving = true; addUser.error = '';
+      try {
+        const r = await fetch('/api/integrations/users/add', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ integration: addUser.integration, email: addUser.email, access_level: addUser.access_level, api_key: addUser.api_key || undefined }) });
+        const d = await r.json();
+        if (d.success) { addUser.open = false; await load(); }
+        else addUser.error = d.error || 'Failed';
+      } catch(e) { addUser.error = e.message; }
+      addUser.saving = false;
+    }
+
     return { groups, users, filteredUsers, groupedUsers, loading, searchQ, showOverridesOnly, groupCounts,
              activeIntegration, integrationTypes, integrationIcons, integrationLabels,
-             groupModal, userEdit, bulkModal,
+             groupModal, userEdit, addUser, bulkModal,
              openNewGroup, openEditGroup, saveGroup, deleteGroup,
-             openUserEdit, saveUserEdit, openBulk, saveBulk,
+             openUserEdit, saveUserEdit, openAddUser, saveAddUser, openBulk, saveBulk,
              levelColor, levelBg, PORTAL_NAMES, ACCESS_LEVELS, ALL_OBJECTS };
   },
   template: `
@@ -4671,6 +4689,7 @@ const Integrations = {
       <div class="flex items-center justify-between mb-3">
         <h2 class="text-sm font-semibold text-gray-400">Connected Users <span class="text-gray-600 text-xs font-normal">(all integrations)</span></h2>
         <div class="flex items-center gap-3">
+          <button @click="openAddUser" class="text-xs px-3 py-1.5 rounded-lg bg-green-700 hover:bg-green-600 text-white font-medium transition-colors">+ Add User</button>
           <label class="flex items-center gap-1.5 text-xs text-gray-500 cursor-pointer">
             <input type="checkbox" v-model="showOverridesOnly" class="accent-blue-500" /> Overrides only
           </label>
@@ -4807,6 +4826,13 @@ const Integrations = {
           <label class="text-gray-500 text-xs block mb-1">Note <span class="text-gray-600">(reason for override)</span></label>
           <input v-model="userEdit.note" placeholder="e.g. Temporary org access for QA campaign" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500" />
         </div>
+        <div v-if="userEdit.row && userEdit.row.integration === 'semrush'">
+          <label class="text-gray-500 text-xs block mb-1">API Key
+            <span v-if="userEdit.row.has_api_key" class="text-green-500 ml-1">✓ key on file</span>
+            <span v-else class="text-yellow-500 ml-1">not set</span>
+          </label>
+          <input v-model="userEdit.api_key" type="password" placeholder="Leave blank to keep existing" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500 font-mono" />
+        </div>
         <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
           <input type="checkbox" v-model="userEdit.enabled" class="accent-blue-500" /> Enabled
         </label>
@@ -4814,6 +4840,38 @@ const Integrations = {
         <div class="flex gap-2">
           <button @click="saveUserEdit" :disabled="userEdit.saving" class="flex-1 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-40 text-white text-xs font-medium">{{ userEdit.saving ? 'Saving\u2026' : 'Save Override' }}</button>
           <button @click="userEdit.open=false" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Add User Modal -->
+    <div v-if="addUser.open" class="fixed inset-0 bg-black/70 flex items-center justify-center z-50" @click.self="addUser.open=false">
+      <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-96 shadow-2xl space-y-4">
+        <h2 class="text-sm font-semibold text-white">Add User to Integration</h2>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Integration</label>
+          <select v-model="addUser.integration" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+            <option v-for="t in integrationTypes" :key="t" :value="t" class="capitalize">{{ integrationLabels[t] || t }}</option>
+          </select>
+        </div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Email <span class="text-red-400">*</span></label>
+          <input v-model="addUser.email" placeholder="user@callboxinc.com" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500" />
+        </div>
+        <div>
+          <label class="text-gray-500 text-xs block mb-1">Access Level</label>
+          <select v-model="addUser.access_level" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500">
+            <option v-for="l in ACCESS_LEVELS" :key="l" :value="l">{{ l }}</option>
+          </select>
+        </div>
+        <div v-if="addUser.integration === 'semrush' || addUser.integration === 'gtmetrix'">
+          <label class="text-gray-500 text-xs block mb-1">API Key</label>
+          <input v-model="addUser.api_key" type="password" :placeholder="addUser.integration === 'gtmetrix' ? 'GTmetrix API key' : 'SEMrush API key'" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200 text-xs outline-none focus:border-blue-500 font-mono" />
+        </div>
+        <div v-if="addUser.error" class="text-red-400 text-xs">❌ {{ addUser.error }}</div>
+        <div class="flex gap-2">
+          <button @click="saveAddUser" :disabled="addUser.saving" class="flex-1 py-2 rounded-lg bg-green-600 hover:bg-green-500 disabled:opacity-40 text-white text-xs font-medium">{{ addUser.saving ? 'Adding…' : 'Add User' }}</button>
+          <button @click="addUser.open=false" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-300 text-xs">Cancel</button>
         </div>
       </div>
     </div>

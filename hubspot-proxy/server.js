@@ -1253,6 +1253,83 @@ app.post('/semrush/keyword/bulk', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── GTmetrix Routes ─────────────────────────────────────────────────────────
+
+const GTMETRIX_API = 'https://gtmetrix.com/api/2.0';
+
+async function getGTMetrixCreds(email) {
+  const r = await dbPool.query(
+    `SELECT ui.credentials FROM fleet.user_integrations ui
+     JOIN fleet.accounts a ON a.id = ui.account_id
+     WHERE a.email = $1 AND ui.integration = 'gtmetrix' AND ui.enabled = true LIMIT 1`,
+    [email]
+  );
+  if (!r.rows.length) return null;
+  const creds = r.rows[0].credentials;
+  return { email: creds.email || email, api_key: creds.api_key };
+}
+
+// POST /gtmetrix/test — submit URL test and wait for results
+app.post('/gtmetrix/test', async (req, res) => {
+  try {
+    const { email, url, location = '1', browser = '3' } = req.body;
+    if (!email || !url) return res.status(400).json({ error: 'email and url required' });
+    const creds = await getGTMetrixCreds(email);
+    if (!creds) return res.status(403).json({ error: 'No GTmetrix access for this user', code: 'GTMETRIX_NO_ACCESS' });
+
+    const auth = Buffer.from(`${creds.email}:${creds.api_key}`).toString('base64');
+    const headers = { Authorization: `Basic ${auth}`, 'Content-Type': 'application/vnd.api+json' };
+
+    // Submit test
+    const submitResp = await axios.post(`${GTMETRIX_API}/tests`, {
+      data: { type: 'test', attributes: { url, browser, location } }
+    }, { headers });
+    const testId = submitResp.data?.data?.id;
+    if (!testId) return res.status(500).json({ error: 'Failed to submit test' });
+
+    // Poll for results (max 60s)
+    let result = null;
+    for (let i = 0; i < 12; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      const pollResp = await axios.get(`${GTMETRIX_API}/tests/${testId}`, { headers });
+      const state = pollResp.data?.data?.attributes?.state;
+      if (state === 'completed') { result = pollResp.data; break; }
+      if (state === 'error') return res.status(500).json({ error: 'GTmetrix test failed', test_id: testId });
+    }
+    if (!result) return res.status(408).json({ error: 'Test timed out — check GTmetrix dashboard', test_id: testId });
+
+    const attrs = result.data.attributes;
+    res.json({
+      url, test_id: testId,
+      grade: attrs.gtmetrix_grade,
+      performance_score: attrs.performance_score,
+      structure_score: attrs.structure_score,
+      lcp: attrs.largest_contentful_paint,
+      tbt: attrs.total_blocking_time,
+      cls: attrs.cumulative_layout_shift,
+      fully_loaded_time: attrs.fully_loaded_time,
+      total_page_size: attrs.total_page_size,
+      total_requests: attrs.page_requests,
+      report_url: result.data?.links?.report_url || null,
+      credits_left: result.meta?.credits_left,
+    });
+  } catch(e) { res.status(500).json({ error: e.response?.data || e.message }); }
+});
+
+// POST /gtmetrix/latest — get latest test result for a URL (no new credits)
+app.post('/gtmetrix/latest', async (req, res) => {
+  try {
+    const { email, test_id } = req.body;
+    if (!email || !test_id) return res.status(400).json({ error: 'email and test_id required' });
+    const creds = await getGTMetrixCreds(email);
+    if (!creds) return res.status(403).json({ error: 'No GTmetrix access for this user', code: 'GTMETRIX_NO_ACCESS' });
+    const auth = Buffer.from(`${creds.email}:${creds.api_key}`).toString('base64');
+    const resp = await axios.get(`${GTMETRIX_API}/tests/${test_id}`, { headers: { Authorization: `Basic ${auth}` } });
+    const attrs = resp.data?.data?.attributes || {};
+    res.json({ test_id, state: attrs.state, grade: attrs.gtmetrix_grade, performance_score: attrs.performance_score, structure_score: attrs.structure_score, lcp: attrs.largest_contentful_paint, tbt: attrs.total_blocking_time, cls: attrs.cumulative_layout_shift, fully_loaded_time: attrs.fully_loaded_time, report_url: resp.data?.data?.links?.report_url || null });
+  } catch(e) { res.status(500).json({ error: e.response?.data || e.message }); }
+});
+
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`hubspot-proxy listening on http://127.0.0.1:${PORT}`);
   console.log(`Routing table: ${ROUTING_TABLE_PATH}`);

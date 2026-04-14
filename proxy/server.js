@@ -217,6 +217,12 @@ async function getClient() {
 http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
 
+  if (req.method === 'GET' && req.url === '/health') {
+    res.writeHead(200, { ...CORS, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, uptime: process.uptime() }));
+    return;
+  }
+
   // ── REST shims ────────────────────────────────────────────────────────────
   // GET /api/sessions/stats?org_id=  →  POST /fleet-api/session/stats
   // GET /api/sessions/reports?org_id= →  POST /fleet-api/session/stats
@@ -231,6 +237,68 @@ http.createServer(async (req, res) => {
     fwd.on('error', e => { res.writeHead(502, CORS); res.end(JSON.stringify({ error: e.message })); });
     fwd.write(JSON.stringify({ org_id }));
     fwd.end();
+    return;
+  }
+
+  // ── Sales Meeting Intel Webhook ───────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/fleet-api/hooks/sales-meeting-intel') {
+    let hookBody = '';
+    req.on('data', c => hookBody += c);
+    req.on('end', () => {
+      let hookPayload = {};
+      try { hookPayload = JSON.parse(hookBody || '{}'); } catch {}
+      res.writeHead(200, CORS);
+      res.end(JSON.stringify({ ok: true }));
+      import('../scripts/sales-meeting-intel-webhook.js')
+        .then(m => m.handleSalesMeetingIntelWebhook(hookPayload))
+        .catch(e => console.error('[smi-webhook]', e.message));
+    });
+    return;
+  }
+
+  // ── Telegram Notify ───────────────────────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/fleet-api/notify') {
+    let notifyBody = '';
+    req.on('data', c => notifyBody += c);
+    req.on('end', () => {
+      let p = {};
+      try { p = JSON.parse(notifyBody || '{}'); } catch {}
+      const tgId     = p.telegram_id || p.to;
+      const text     = p.message || p.text;
+      const botToken = process.env.BOT_TOKEN_SALES;
+      if (!tgId || !text || !botToken) {
+        res.writeHead(400, CORS);
+        res.end(JSON.stringify({ error: 'Missing telegram_id/to, message/text, or BOT_TOKEN_SALES not set' }));
+        return;
+      }
+      const tgBody = JSON.stringify({ chat_id: String(tgId), text });
+      const tgReq = https.request({
+        hostname: 'api.telegram.org',
+        path: `/bot${botToken}/sendMessage`,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(tgBody) }
+      }, tgRes => {
+        let d = '';
+        tgRes.on('data', c => d += c);
+        tgRes.on('end', () => {
+          try {
+            const r = JSON.parse(d);
+            res.writeHead(r.ok ? 200 : 400, CORS);
+            res.end(JSON.stringify(r.ok ? { ok: true } : { error: r.description }));
+          } catch {
+            res.writeHead(200, CORS);
+            res.end(JSON.stringify({ ok: true }));
+          }
+        });
+      });
+      tgReq.on('error', e => {
+        res.writeHead(500, CORS);
+        res.end(JSON.stringify({ error: e.message }));
+      });
+      tgReq.setTimeout(10000, () => { tgReq.destroy(); });
+      tgReq.write(tgBody);
+      tgReq.end();
+    });
     return;
   }
 
@@ -802,10 +870,16 @@ http.createServer(async (req, res) => {
           const global = globalR.rows[0] || {};
           const agent = agentR.rows[0];
           // Merge: global system_prompt prepended to agent-specific, skill_maps merged
+          // Replace {{AGENT_SLUG}}, {{AGENT_NAME}}, {{AGENT_ID}} placeholders
+          const _mergedPrompt = (global.system_prompt ? global.system_prompt + '\n\n---\n\n' : '') + agent.system_prompt;
+          const _resolvedPrompt = _mergedPrompt
+            .replace(/\{\{AGENT_SLUG\}\}/g, agent.slug || '')
+            .replace(/\{\{AGENT_NAME\}\}/g, agent.name || '')
+            .replace(/\{\{AGENT_ID\}\}/g, p.agent_id || '');
           result = {
             config: {
               ...agent,
-              system_prompt: (global.system_prompt ? global.system_prompt + '\n\n---\n\n' : '') + agent.system_prompt,
+              system_prompt: _resolvedPrompt,
               skill_map: { ...(global.skill_map || {}), ...(agent.skill_map || {}) },
               behaviors: { ...(global.behaviors || {}), ...(agent.behaviors || {}) },
             }
@@ -924,7 +998,7 @@ http.createServer(async (req, res) => {
                 );
                 smMatchRow = smR.rows[0];
               }
-              const SM_THRESHOLD = 0.65;
+              const SM_THRESHOLD = 0.62;
               if (!smMatchRow || parseFloat(smMatchRow.confidence) < SM_THRESHOLD) {
                 result = { match: null, confidence: smMatchRow ? parseFloat(parseFloat(smMatchRow.confidence).toFixed(4)) : 0, reason: 'no confident match' };
               } else {

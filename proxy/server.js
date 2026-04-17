@@ -173,27 +173,40 @@ const PORT = process.env.PORT || 20000;
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const GEMINI_KEY = process.env.GEMINI_API_KEY || OPENAI_KEY;
-const nodemailer = require('nodemailer');
-const SMTP_FROM = process.env.SMTP_FROM || 'Callbox Fleet <oc@callboxinc.com>';
-const smtpTransport = nodemailer.createTransport({
-  host: process.env.SMTP_HOST || 'callboxinc.com',
-  port: parseInt(process.env.SMTP_PORT || '465'),
-  secure: process.env.SMTP_SECURE !== 'false',
-  auth: {
-    user: process.env.SMTP_USER || 'oc@callboxinc.com',
-    pass: process.env.SMTP_PASS || ''
-  }
-});
+const RESEND_API_KEY = process.env.RESEND_API_KEY || 're_FzjKkQut_jrMVMjQjykezidamy6cJYkZn';
+const RESEND_FROM = process.env.RESEND_FROM || 'Callbox Fleet <noreply@oc.callboxinc.ai>';
 
 async function sendOTPEmail(to, otp, name) {
-  if (!process.env.SMTP_USER && !smtpTransport.options?.auth?.user) throw new Error('SMTP_USER not set');
-  const info = await smtpTransport.sendMail({
-    from: SMTP_FROM,
-    to,
+  const payload = JSON.stringify({
+    from: RESEND_FROM,
+    to: [to],
     subject: 'Your Callbox Fleet Verification Code',
     html: `<p>Hi ${name || 'there'},</p><p>Your verification code for <strong>Callbox Fleet</strong> is:</p><h2 style="font-size:32px;letter-spacing:8px;font-family:monospace">${otp}</h2><p>This code expires in <strong>10 minutes</strong>. Do not share it.</p><p>If you did not request this, please ignore this email.</p><p>— Callbox Fleet</p>`
   });
-  return info;
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'api.resend.com',
+      path: '/emails',
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${RESEND_API_KEY}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        const body = JSON.parse(d);
+        if (res.statusCode >= 400) reject(new Error(body.message || 'Resend error'));
+        else resolve(body);
+      });
+    });
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
 }
 
 // Local Docker PG (primary) — fallback to Supabase if LOCAL_PG_ONLY not set
@@ -605,6 +618,7 @@ http.createServer(async (req, res) => {
         // p: { telegram_id, org_id, agent_id?, message?, message_id? }
         const r = await pg.query(
           `SELECT tb.telegram_id, tb.telegram_name, tb.bound_at, tb.agent_id AS binding_agent_id,
+                  a.id AS account_id,
                   a.email, a.name, a.role, a.department, a.permissions, a.is_active
            FROM fleet.telegram_bindings tb
            JOIN fleet.accounts a ON a.id = tb.account_id
@@ -615,8 +629,8 @@ http.createServer(async (req, res) => {
           const bound_to_this_agent = p.agent_id
             ? r.rows.some(b => b.binding_agent_id === p.agent_id)
             : false;
-          const { binding_agent_id, ...user } = r.rows[0];
-          result = { bound: true, bound_to_this_agent, user };
+          const { binding_agent_id, account_id, ...userFields } = r.rows[0];
+          result = { bound: true, bound_to_this_agent, account_id, user: userFields };
         } else {
           result = { bound: false };
         }
@@ -625,15 +639,17 @@ http.createServer(async (req, res) => {
         if (p.agent_id && p.message && p.telegram_id) {
           (async () => {
             try {
-              // Upsert conversation row
+              // Upsert conversation row — include user_id so token-guard can track per-user cost
+              const accountId = r.rows[0]?.account_id || null;
               const convR = await pg.query(
                 `INSERT INTO fleet.conversations
-                   (org_id, agent_id, platform, platform_conversation_id, status, title, chat_type, channel)
-                 VALUES ($1,$2,'telegram',$3,'active',$4,'direct','telegram')
+                   (org_id, agent_id, platform, platform_conversation_id, status, title, chat_type, channel, user_id)
+                 VALUES ($1,$2,'telegram',$3,'active',$4,'direct','telegram',$5)
                  ON CONFLICT (org_id, platform, platform_conversation_id, agent_id)
-                 DO UPDATE SET last_message_at=now() RETURNING id`,
+                 DO UPDATE SET last_message_at=now(), user_id=COALESCE(fleet.conversations.user_id, EXCLUDED.user_id) RETURNING id`,
                 [p.org_id, p.agent_id, p.telegram_id,
-                 (r.rows[0]?.name || p.telegram_id) + ' / ' + p.agent_id.slice(0,8)]
+                 (r.rows[0]?.name || p.telegram_id) + ' / ' + p.agent_id.slice(0,8),
+                 accountId]
               );
               const conv_id = convR.rows[0].id;
               // Detect /reset or /start — auto-reset session at proxy level
@@ -1856,6 +1872,121 @@ http.createServer(async (req, res) => {
           by_agent: byAgentR.rows,
           reset_reasons: resetR.rows
         };
+
+      // ── Token Guard: check daily token usage for an account ─────────────────
+      } else if (fn === 'token-guard/check') {
+        // p: { org_id, account_id }
+        // Returns: { allowed, blocked_by, used_tokens, used_cost_usd, limit_tokens, limit_cost_usd, remaining_tokens, remaining_cost_usd }
+        const { org_id, account_id } = p;
+        if (!org_id || !account_id) {
+          result = { error: 'org_id and account_id required' };
+        } else {
+          // Load per-account limits from permissions, fall back to defaults
+          const acctR = await pg.query(
+            `SELECT permissions FROM fleet.accounts WHERE org_id = $1 AND id = $2`,
+            [org_id, account_id]
+          );
+          const perms = acctR.rows[0]?.permissions || {};
+          const DEFAULT_TOKEN_LIMIT = 500000;   // output tokens/day
+          const DEFAULT_COST_LIMIT  = 10.00;    // USD/day
+          const tokenLimit = perms.daily_token_limit || DEFAULT_TOKEN_LIMIT;
+          const costLimit  = perms.daily_cost_limit  || DEFAULT_COST_LIMIT;
+
+          // Sum output_tokens for today (Asia/Manila day boundary)
+          // NOTE: cost_usd column is inflated by sync-sessions bug (cumulative not delta)
+          // So we derive cost from output_tokens using Sonnet 4.5 pricing: $3/MTok output
+          const COST_PER_OUTPUT_TOKEN = 3.0 / 1_000_000; // $3 per million output tokens
+          const r = await pg.query(`
+            SELECT
+              COALESCE(SUM(m.output_tokens), 0)::int  AS used_tokens,
+              COALESCE(SUM(m.input_tokens), 0)::int   AS used_input_tokens,
+              COALESCE(SUM(m.cache_read_tokens), 0)::int AS cache_read_tokens
+            FROM fleet.messages m
+            JOIN fleet.conversations c ON c.id = m.conversation_id
+            WHERE c.org_id = $1
+              AND c.user_id = $2
+              AND c.user_id IS NOT NULL
+              AND m.role = 'assistant'
+              AND m.created_at >= date_trunc('day', now() AT TIME ZONE 'Asia/Manila') AT TIME ZONE 'Asia/Manila'
+          `, [org_id, account_id]);
+
+          const usedTokens     = parseInt(r.rows[0].used_tokens, 10);
+          const usedInputTokens = parseInt(r.rows[0].used_input_tokens, 10);
+          const cacheReadTokens = parseInt(r.rows[0].cache_read_tokens, 10);
+          // Approximate cost: output $3/MTok + input $3/MTok + cache_read $0.30/MTok
+          const usedCost = parseFloat((
+            (usedTokens * 3.0 / 1_000_000) +
+            (usedInputTokens * 3.0 / 1_000_000) +
+            (cacheReadTokens * 0.30 / 1_000_000)
+          ).toFixed(6));
+
+          const tokenExceeded = usedTokens >= tokenLimit;
+          const costExceeded  = usedCost   >= costLimit;
+          const allowed = !tokenExceeded && !costExceeded;
+
+          // Tell the agent which limit triggered (for a better user-facing message)
+          let blocked_by = null;
+          if (tokenExceeded && costExceeded) blocked_by = 'both';
+          else if (tokenExceeded)            blocked_by = 'tokens';
+          else if (costExceeded)             blocked_by = 'cost';
+
+          result = {
+            allowed,
+            blocked_by,
+            used_tokens:       usedTokens,
+            used_cost_usd:     usedCost,
+            limit_tokens:      tokenLimit,
+            limit_cost_usd:    costLimit,
+            remaining_tokens:  Math.max(0, tokenLimit - usedTokens),
+            remaining_cost_usd: Math.max(0, parseFloat((costLimit - usedCost).toFixed(6)))
+          };
+        }
+
+      // ── Token Guard: get per-account daily limits ─────────────────────────────
+      } else if (fn === 'token-guard/limit') {
+        // p: { org_id, account_id }
+        // Returns: { limit_tokens, limit_cost_usd }
+        const { org_id, account_id } = p;
+        if (!org_id || !account_id) {
+          result = { error: 'org_id and account_id required' };
+        } else {
+          const r = await pg.query(
+            `SELECT permissions FROM fleet.accounts WHERE org_id = $1 AND id = $2`,
+            [org_id, account_id]
+          );
+          const perms = r.rows[0]?.permissions || {};
+          result = {
+            limit_tokens:   perms.daily_token_limit || 500000,
+            limit_cost_usd: perms.daily_cost_limit  || 10.00
+          };
+        }
+
+      // ── Token Guard: set per-account daily limits ─────────────────────────────
+      } else if (fn === 'token-guard/set-limit') {
+        // p: { org_id, account_id, limit_tokens?, limit_cost_usd? }
+        const { org_id, account_id, limit_tokens, limit_cost_usd } = p;
+        if (!org_id || !account_id || (limit_tokens == null && limit_cost_usd == null)) {
+          result = { error: 'org_id, account_id, and at least one of limit_tokens or limit_cost_usd required' };
+        } else {
+          // Patch only the provided fields
+          const updates = [];
+          const vals = [org_id, account_id];
+          if (limit_tokens != null) {
+            vals.push(JSON.stringify(limit_tokens));
+            updates.push(`jsonb_set(COALESCE(permissions, '{}'), '{daily_token_limit}', $${vals.length}::jsonb)`);
+          }
+          if (limit_cost_usd != null) {
+            vals.push(JSON.stringify(limit_cost_usd));
+            updates.push(`jsonb_set(COALESCE(permissions, '{}'), '{daily_cost_limit}', $${vals.length}::jsonb)`);
+          }
+          // Chain jsonb_set calls
+          const permExpr = updates.reduce((acc, cur) => cur.replace('COALESCE(permissions, \'{}\')', acc));
+          await pg.query(
+            `UPDATE fleet.accounts SET permissions = ${permExpr} WHERE org_id = $1 AND id = $2`,
+            vals
+          );
+          result = { success: true, account_id, limit_tokens, limit_cost_usd };
+        }
 
       // ── Session: heatmap ─────────────────────────────────────────────────────
       } else if (fn === "session/heatmap") {

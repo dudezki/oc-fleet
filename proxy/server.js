@@ -334,11 +334,15 @@ http.createServer(async (req, res) => {
 
       // ── Memory ──────────────────────────────────────────────────────────
       if (fn === 'store') {
+        // user_id scopes episodic/long_term memories to a specific user
+        // knowledge type is always org-wide (user_id ignored)
+        const memType = p.memory_type || 'long_term';
+        const userId = (memType !== 'knowledge') ? (p.user_id || p.account_id || null) : null;
         const r = await pg.query(
-          `INSERT INTO fleet.memories (org_id, agent_id, content, memory_type, visibility, salience)
-           VALUES ($1, $2, $3, $4, $5, $6)
+          `INSERT INTO fleet.memories (org_id, agent_id, user_id, content, memory_type, visibility, salience)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
            RETURNING id, content, created_at`,
-          [p.org_id, p.agent_id, p.content, p.memory_type || 'long_term', p.visibility || 'org', p.salience || 0.7]
+          [p.org_id, p.agent_id, userId, p.content, memType, p.visibility || 'org', p.salience || 0.7]
         );
         result = r.rows[0];
 
@@ -1387,15 +1391,16 @@ http.createServer(async (req, res) => {
 
       // ── Search: embed text then search ───────────────────────────────────
       } else if (fn === 'search/embed') {
-        // p: { text, org_id, agent_id?, limit?, memory_types? }
+        // p: { text, org_id, agent_id?, user_id?, limit?, memory_types? }
         const limit = p.limit || 10;
         const agentId = p.agent_id || null;
+        const userId = p.user_id || null;
         const memoryTypes = p.memory_types || null; // e.g. ['knowledge'] to filter type
         const [embedding] = await embedTexts([p.text], GEMINI_KEY);
         const embeddingStr = '[' + embedding.join(',') + ']';
         const r = await pg.query(
-          `SELECT * FROM fleet.search_memories_scored($1, $2::vector, $3, $4, $5::text[], 0.35, 0.25, 0.25, 0.15)`,
-          [p.org_id, embeddingStr, limit, agentId, memoryTypes]
+          `SELECT * FROM fleet.search_memories_scored($1, $2::vector, $3, $4, $5::text[], 0.35, 0.25, 0.25, 0.15, $6)`,
+          [p.org_id, embeddingStr, limit, agentId, memoryTypes, userId]
         );
         result = { results: r.rows };
 

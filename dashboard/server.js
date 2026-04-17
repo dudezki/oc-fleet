@@ -38,7 +38,23 @@ async function getInstances() {
         } catch { return null; }
       })();
       const meta = a.config?.meta || {};
-      return { name: a.slug, displayName: a.name, id: a.id, port, home: 'cbfleet-rag-' + a.slug, model: meta.model || null, provider: meta.provider || 'anthropic', emoji: meta.emoji || '🤖' };
+      // Read live model/provider from openclaw.json
+      let liveModel = meta.model || null;
+      let liveProvider = meta.provider || 'anthropic';
+      try {
+        const ocCfg = JSON.parse(fs.readFileSync(
+          path.join(os.homedir(), 'cbfleet-rag-' + a.slug, '.openclaw', 'openclaw.json'), 'utf8'
+        ));
+        const primary = ocCfg.agents?.defaults?.model?.primary || ocCfg.agents?.list?.[0]?.model || null;
+        if (primary) {
+          liveModel = primary;
+          if (primary.startsWith('openrouter/')) liveProvider = 'openrouter';
+          else if (primary.startsWith('anthropic/')) liveProvider = 'anthropic';
+          else if (primary.startsWith('google/') || primary.includes('gemini')) liveProvider = 'google';
+          else if (primary.startsWith('openai/') || primary.includes('gpt')) liveProvider = 'openai';
+        }
+      } catch {}
+      return { name: a.slug, displayName: a.name, id: a.id, port, home: 'cbfleet-rag-' + a.slug, model: liveModel, provider: liveProvider, emoji: meta.emoji || '🤖' };
     }).filter(i => i.port);
   } catch {
     return [
@@ -1638,9 +1654,21 @@ app.post('/api/agents/spawn', async (req, res) => {
         profiles: { 'anthropic:default': { provider: 'anthropic', mode: 'token' } },
       },
       agents: {
-        list: [{ id: 'main', name, model: model || 'claude-haiku-4-5-20251001' }],
-        defaults: { timeoutSeconds: 300 },
+        list: [{ id: 'main', name, model: model || 'anthropic/claude-haiku-4-5' }],
+        defaults: {
+          timeoutSeconds: 300,
+          model: { primary: model || 'anthropic/claude-haiku-4-5', fallbacks: ['anthropic/claude-sonnet-4-6'] },
+          models: { 'anthropic/claude-haiku-4-5': { params: { cacheRetention: 'short' } }, 'anthropic/claude-sonnet-4-6': { params: { cacheRetention: 'short' } } },
+          contextPruning: {
+            mode: 'cache-ttl', ttl: '55m', keepLastAssistants: 3,
+            softTrim: { maxChars: 4000, headChars: 1500, tailChars: 1500 },
+            hardClear: { enabled: true, placeholder: '[Old tool result content cleared]' }
+          },
+          heartbeat: { every: '50m', target: 'last' },
+          compaction: { mode: 'safeguard' }
+        },
       },
+      hooks: { internal: { entries: { 'fleet-rag-injector': { enabled: false }, 'session-memory': { enabled: false }, 'self-improving-agent': { enabled: false } } } },
       tools: { exec: { host: 'gateway', security: 'full', ask: 'off' } },
       channels: {
         telegram: {
@@ -1662,7 +1690,7 @@ app.post('/api/agents/spawn', async (req, res) => {
           },
         },
       },
-      session: { dmScope: 'main' },
+      session: { dmScope: 'per-peer' },
     };
     fs.writeFileSync(
       path.join(agentHome, '.openclaw', 'openclaw.json'),
@@ -1781,11 +1809,28 @@ app.get('/api/agents', async (req, res) => {
           health = h.ok ? 'up' : 'down';
         } catch { health = 'down'; }
       }
+      // Read live model/provider from openclaw.json
+      let liveModel = meta.model || null;
+      let liveProvider = meta.provider || 'anthropic';
+      try {
+        const ocRaw = fs.readFileSync(
+          path.join(os.homedir(), 'cbfleet-rag-' + a.slug, '.openclaw', 'openclaw.json'), 'utf8'
+        );
+        const ocCfg = JSON.parse(ocRaw);
+        const primary = ocCfg.agents?.defaults?.model?.primary || ocCfg.agents?.list?.[0]?.model || null;
+        if (primary) {
+          liveModel = primary;
+          if (primary.startsWith('openrouter/')) liveProvider = 'openrouter';
+          else if (primary.startsWith('anthropic/')) liveProvider = 'anthropic';
+          else if (primary.startsWith('google/') || primary.includes('gemini')) liveProvider = 'google';
+          else if (primary.startsWith('openai/') || primary.includes('gpt')) liveProvider = 'openai';
+        }
+      } catch {}
       return {
         id: a.id, name: a.name, slug: a.slug, status: a.status,
         emoji: meta.emoji || '🤖',
-        model: meta.model || null,
-        provider: meta.provider || 'anthropic',
+        model: liveModel,
+        provider: liveProvider,
         port,
         health,
       };
@@ -1852,11 +1897,19 @@ app.post('/api/agents/spawn', async (req, res) => {
     const ocConfig = {
       gateway:{port,mode:'local',bind:'loopback',auth:{mode:'token',token:gatewayToken}},
       auth:{profiles:{'anthropic:default':{provider:'anthropic',mode:'token'}}},
-      agents:{list:[{id:'main',name,model}],defaults:{timeoutSeconds:300}},
+      agents:{list:[{id:'main',name,model}],defaults:{
+        timeoutSeconds:300,
+        model:{primary:model||'anthropic/claude-haiku-4-5',fallbacks:['anthropic/claude-sonnet-4-6']},
+        models:{'anthropic/claude-haiku-4-5':{params:{cacheRetention:'short'}},'anthropic/claude-sonnet-4-6':{params:{cacheRetention:'short'}}},
+        contextPruning:{mode:'cache-ttl',ttl:'55m',keepLastAssistants:3,softTrim:{maxChars:4000,headChars:1500,tailChars:1500},hardClear:{enabled:true,placeholder:'[Old tool result content cleared]'}},
+        heartbeat:{every:'50m',target:'last'},
+        compaction:{mode:'safeguard'}
+      }},
+      hooks:{internal:{entries:{'fleet-rag-injector':{enabled:false},'session-memory':{enabled:false},'self-improving-agent':{enabled:false}}}},
       tools:{exec:{host:'gateway',security:'full',ask:'off'}},
       channels:{telegram:{enabled:true,dmPolicy:'open',allowFrom:['*'],groupPolicy:'open',streaming:'partial',defaultAccount:'default',
         accounts:{default:{botToken:bot_token,dmPolicy:'open',allowFrom:['*'],streaming:'partial',actions:{reactions:true}}}}},
-      session:{dmScope:'main'}
+      session:{dmScope:'per-peer'}
     };
     fs.writeFileSync(`${agentHome}/.openclaw/openclaw.json`,JSON.stringify(ocConfig,null,2));
     // Write auth-profiles

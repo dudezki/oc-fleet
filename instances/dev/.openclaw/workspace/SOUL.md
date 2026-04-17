@@ -60,7 +60,7 @@ curl -s -X POST http://127.0.0.1:20000/fleet-api/pairing/check \
 - `bound: true` → greet by name, continue to Step B
 - `bound: false` → ask for Callbox email, run OTP flow (see below), stop until paired
 
-### Step B — RAG lookup (MANDATORY — do this before every reply)
+### Step B — Memory recall (on-demand only)
 ```bash
 curl -s -X POST http://127.0.0.1:20000/fleet-api/search/embed \
   -H "Content-Type: application/json" \

@@ -221,6 +221,8 @@ function modelBadgeClass(model) {
   if (m.includes('gemini') || m.includes('gemma')) return 'bg-blue-900/50 text-blue-300';
   if (m.includes('opus')) return 'bg-yellow-900/50 text-yellow-300';
   if (m.includes('sonnet')) return 'bg-purple-900/50 text-purple-300';
+  if (m.includes('haiku')) return 'bg-teal-900/50 text-teal-300';
+  if (m.includes('openrouter')) return 'bg-violet-900/50 text-violet-300';
   if (m.includes('llama') || m.includes('ollama') || m.includes('lmstudio') || m.includes('vllm')) return 'bg-orange-900/50 text-orange-300';
   return 'bg-slate-700/50 text-slate-300';
 }
@@ -244,6 +246,10 @@ function providerIcon(provider, model) {
   if (p === 'ollama' || p === 'vllm' || p === 'lmstudio' || m.includes('llama') || m.includes('gemma-4')) {
     return `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" class="text-orange-400"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 14H9V8h2v8zm4 0h-2V8h2v8z"/></svg>`;
   }
+  // OpenRouter
+  if (p === 'openrouter' || m.includes('openrouter')) {
+    return `<svg width="14" height="14" viewBox="0 0 100 100" fill="currentColor" class="text-violet-400"><path d="M50 5 L95 27.5 L95 72.5 L50 95 L5 72.5 L5 27.5 Z" fill="none" stroke="currentColor" stroke-width="8"/><circle cx="50" cy="50" r="15" fill="currentColor"/></svg>`;
+  }
   // Default
   return `<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" class="text-gray-400"><circle cx="12" cy="12" r="10"/></svg>`;
 }
@@ -251,6 +257,7 @@ function providerIcon(provider, model) {
 function providerLabel(provider, model) {
   const p = String(provider || '').toLowerCase();
   const m = String(model || '').toLowerCase();
+  if (p === 'openrouter' || m.startsWith('openrouter/')) return 'OpenRouter';
   if (p === 'anthropic' || m.includes('claude')) return 'Anthropic';
   if (m.includes('gemma-4') || p === 'vllm' || p === 'lmstudio') return 'LM Studio (local)';
   if (p === 'ollama' || m.includes('ollama')) return 'Ollama (local)';

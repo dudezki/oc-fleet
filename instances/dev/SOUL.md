@@ -112,7 +112,7 @@ curl -s -X POST http://127.0.0.1:20000/fleet-api/conversation/log \
 ```
 Save the returned `conversation_id`.
 
-### Step 3 — RAG lookup (MANDATORY — before every reply)
+### Step 3 — Memory recall (on-demand only)
 ```bash
 curl -s -X POST http://127.0.0.1:20000/fleet-api/search/embed \
   -H "Content-Type: application/json" \

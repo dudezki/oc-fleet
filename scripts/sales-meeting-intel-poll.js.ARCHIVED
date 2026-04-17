@@ -1,0 +1,403 @@
+#!/usr/bin/env node
+/**
+ * sales-meeting-intel-poll.js
+ * Fleet v2 replacement for v1 Mac-based sales-meeting-intel skill
+ * Runs every 10 minutes via cron
+ *
+ * Flow A: Pre-meeting intel for contacts with upcoming appointments
+ * Flow B: Post-meeting debrief for completed exploratory calls
+ * Delivers via Telegram DM to contact owner (fallback: Sheryll 8618648518)
+ */
+
+import fs from 'fs';
+import https from 'https';
+import http from 'http';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const { Client } = require('pg');
+const Anthropic = require('@anthropic-ai/sdk');
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const ENV_PATH = '/home/dev-user/Projects/oc-fleet/.env';
+const PROCESSED_LOG = '/tmp/sales-meeting-intel-processed.json';
+const PORTAL_ID = '4950628';
+const HS_BASE = 'https://api.hubapi.com';
+const HS_AUTH_PROXY = 'http://127.0.0.1:19002';
+const FLEET_PROXY = 'http://127.0.0.1:20000';
+const ORG_ID = 'f86d92cb-db10-43ff-9ff2-d69c319d272d';
+const AGENT_ID = 'b81c0d8a-3f76-43fe-b2e5-2537801085dc';
+const FALLBACK_TG_ID = '8618648518'; // Sheryll
+const DB_URL = 'postgresql://postgres:fleetdev@127.0.0.1:5433/fleet_dev';
+const AUTH_EMAIL = 'emye@callboxinc.com';
+
+// Load .env
+const envVars = {};
+try {
+  fs.readFileSync(ENV_PATH, 'utf8').split('\n').forEach(line => {
+    const [k, ...v] = line.split('=');
+    if (k && !k.startsWith('#')) envVars[k.trim()] = v.join('=').trim();
+  });
+} catch {}
+
+const ANTHROPIC_KEY = envVars.ANTHROPIC_API_KEY || process.env.ANTHROPIC_API_KEY;
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function loadProcessed() {
+  try { return JSON.parse(fs.readFileSync(PROCESSED_LOG, 'utf8')); } catch { return []; }
+}
+
+function saveProcessed(ids) {
+  fs.writeFileSync(PROCESSED_LOG, JSON.stringify(ids, null, 2));
+}
+
+function httpRequest(url, options = {}, body = null) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const opts = {
+      hostname: parsed.hostname,
+      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      ...options
+    };
+    const req = mod.request(opts, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+        catch { resolve({ status: res.statusCode, body: data }); }
+      });
+    });
+    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.on('error', reject);
+    if (body) req.write(typeof body === 'string' ? body : JSON.stringify(body));
+    req.end();
+  });
+}
+
+async function getHubSpotToken() {
+  // Use emye's OAuth token via hubspot-oauth proxy (user-scoped, not admin)
+  const r = await httpRequest(`${HS_AUTH_PROXY}/token?email=${AUTH_EMAIL}&portal_id=${PORTAL_ID}`);
+  if (r.body?.access_token) return r.body.access_token;
+  throw new Error(`HubSpot OAuth token not available for ${AUTH_EMAIL}: ${JSON.stringify(r.body)}`);
+}
+
+async function hsGet(path, token) {
+  return httpRequest(`${HS_BASE}${path}`, {
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+  });
+}
+
+async function hsPost(path, token, body) {
+  return httpRequest(`${HS_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+  }, body);
+}
+
+async function hsPatch(path, token, body) {
+  return httpRequest(`${HS_BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }
+  }, body);
+}
+
+async function getOwnerTelegramId(ownerEmail) {
+  const client = new Client({ connectionString: DB_URL });
+  try {
+    await client.connect();
+    const r = await client.query(
+      `SELECT tb.telegram_id FROM fleet.accounts a 
+       JOIN fleet.telegram_bindings tb ON tb.account_id = a.id 
+       WHERE LOWER(a.email) = LOWER($1) LIMIT 1`,
+      [ownerEmail]
+    );
+    return r.rows[0]?.telegram_id || FALLBACK_TG_ID;
+  } catch { return FALLBACK_TG_ID; }
+  finally { await client.end(); }
+}
+
+async function getOwnerEmail(ownerId, token) {
+  try {
+    const r = await hsGet(`/crm/v3/owners/${ownerId}`, token);
+    return r.body?.email || null;
+  } catch { return null; }
+}
+
+async function sendTelegramDM(telegramId, text) {
+  return httpRequest(`${FLEET_PROXY}/fleet-api/notify`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  }, { to: telegramId, text });
+}
+
+async function storeMemory(content) {
+  return httpRequest(`${FLEET_PROXY}/fleet-api/store`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' }
+  }, {
+    fn: 'store',
+    org_id: ORG_ID,
+    agent_id: AGENT_ID,
+    memory_type: 'episodic',
+    visibility: 'org',
+    salience: 0.85,
+    content
+  });
+}
+
+async function generateIntel(prompt) {
+  const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
+  const msg = await anthropic.messages.create({
+    model: 'claude-haiku-4-5',
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: prompt }]
+  });
+  return msg.content[0]?.text || '';
+}
+
+// ── Prompts ───────────────────────────────────────────────────────────────────
+function preMeetingPrompt(contact) {
+  return `You are a senior strategic marketing advisor and B2B lead-generation specialist.
+I am the VP of Business Development at Callbox (callboxinc.com), a global B2B lead-generation and sales-enablement company.
+
+I have an upcoming exploratory call with ${contact.name}, ${contact.jobtitle} at ${contact.company} (${contact.website || 'website unknown'}).
+
+Provide a concise PRE-MEETING brief with:
+1. Prospect Context - short business profile, likely target markets, growth signals
+2. ICP Hypothesis - ideal customer profile, pain points, buying triggers
+3. Call Prep - 3 probing questions to uncover gaps in their lead generation
+4. Company Intel - HQ, estimated revenue, top 3 competitors
+
+Keep it concise and actionable. Do not use em dashes.`;
+}
+
+function icpTamPrompt(contact) {
+  return `You are a senior B2B market research analyst.
+
+Company: ${contact.company} (${contact.website || 'website unknown'})
+Contact: ${contact.name}, ${contact.jobtitle}
+
+Provide a concise ICP and TAM analysis:
+1. Buyer Personas - key decision-maker titles and buying centers
+2. Target Geographies - primary and secondary markets
+3. Pain Points and Buying Triggers - top 3 pain points, buying triggers
+4. Common Objections - to outsourced lead generation and how to address them
+
+Keep it concise. Do not use em dashes.`;
+}
+
+function postMeetingPrompt(contact, callNotes) {
+  return `You are a senior B2B sales strategist and revenue intelligence analyst.
+I am the VP of Business Development at Callbox (callboxinc.com).
+
+I just completed an exploratory call with ${contact.name}, ${contact.jobtitle} at ${contact.company}.
+
+Call notes:
+${callNotes}
+
+Provide a POST-MEETING debrief:
+1. Updated Prospect Context - pain points confirmed, stakeholders identified, budget signals
+2. Qualification Assessment - BANT/CHAMP scoring based on call
+3. Recommended Next Steps - specific follow-up actions with timeline
+4. Proposal Angle - how to position Callbox for this prospect
+
+Keep it actionable. Do not use em dashes.`;
+}
+
+// ── Flow A: Pre-Meeting Intel ─────────────────────────────────────────────────
+async function runFlowA(token, processed) {
+  console.log('\n[Flow A] Checking for upcoming appointments...');
+  const nowMs = Date.now();
+
+  const result = await hsPost('/crm/v3/objects/contacts/search', token, {
+    filterGroups: [{
+      filters: [
+        { propertyName: 'hs_lead_status', operator: 'EQ', value: 'Appointment Set by SDR' },
+        { propertyName: 'callbox_first_appointment_date', operator: 'GT', value: String(nowMs) },
+        { propertyName: 'callbox_date_submitted', operator: 'HAS_PROPERTY' }
+      ]
+    }],
+    properties: [
+      'firstname', 'lastname', 'company', 'jobtitle', 'website',
+      'hs_object_id', 'hubspot_owner_id', 'hs_lead_source',
+      'callbox_first_appointment_date', 'callbox_premeet_generated'
+    ],
+    limit: 50
+  });
+
+  const contacts = result.body?.results || [];
+  const unprocessed = contacts.filter(c =>
+    c.properties?.callbox_premeet_generated !== 'true' &&
+    !processed.includes(`flowA_${c.id}`)
+  );
+
+  console.log(`  Found ${contacts.length} contacts, ${unprocessed.length} unprocessed`);
+
+  for (const contact of unprocessed) {
+    const p = contact.properties;
+    const info = {
+      id: contact.id,
+      name: `${p.firstname || ''} ${p.lastname || ''}`.trim() || 'Unknown',
+      company: p.company || 'Unknown Company',
+      jobtitle: p.jobtitle || 'Unknown Title',
+      website: p.website || '',
+      owner_id: p.hubspot_owner_id,
+      hsUrl: `https://app-na2.hubspot.com/contacts/${PORTAL_ID}/contact/${contact.id}`
+    };
+
+    console.log(`  Processing: ${info.name} @ ${info.company}`);
+
+    try {
+      // Generate intel
+      const [preMeeting, icpTam] = await Promise.all([
+        generateIntel(preMeetingPrompt(info)),
+        generateIntel(icpTamPrompt(info))
+      ]);
+
+      const fullBrief = `PRE-MEETING INTEL: ${info.name} @ ${info.company}\n\n=== PRE-MEETING BRIEF ===\n${preMeeting}\n\n=== ICP + TAM ANALYSIS ===\n${icpTam}\n\nHubSpot: ${info.hsUrl}`;
+
+      // Store in fleet DB
+      await storeMemory(`SALES MEETING INTEL — Pre-Meeting\nContact: ${info.name} @ ${info.company}\nDate: ${new Date().toISOString().split('T')[0]}\n\n${fullBrief}`);
+
+      // Get owner Telegram ID
+      const ownerEmail = info.owner_id ? await getOwnerEmail(info.owner_id, token) : null;
+      const tgId = ownerEmail ? await getOwnerTelegramId(ownerEmail) : FALLBACK_TG_ID;
+
+      // Send DM
+      const msg = `📋 Pre-meeting intel ready for ${info.name} at ${info.company}\n\n${preMeeting.slice(0, 800)}...\n\n🔗 ${info.hsUrl}`;
+      await sendTelegramDM(tgId, msg);
+      console.log(`  Sent to TG: ${tgId}`);
+
+      // Mark processed
+      processed.push(`flowA_${contact.id}`);
+
+      // Update HubSpot property
+      await hsPatch(`/crm/v3/objects/contacts/${contact.id}`, token, {
+        properties: { callbox_premeet_generated: 'true' }
+      });
+
+    } catch (err) {
+      console.error(`  Error processing ${info.name}: ${err.message}`);
+    }
+  }
+
+  return unprocessed.length;
+}
+
+// ── Flow B: Post-Meeting Debrief ──────────────────────────────────────────────
+async function runFlowB(token, processed) {
+  console.log('\n[Flow B] Checking for completed exploratory call notes...');
+
+  const result = await hsPost('/crm/v3/objects/calls/search', token, {
+    filterGroups: [{
+      filters: [
+        { propertyName: 'hs_call_title', operator: 'CONTAINS_TOKEN', value: 'Exploratory Meeting' },
+        { propertyName: 'hs_call_body', operator: 'HAS_PROPERTY' }
+      ]
+    }],
+    properties: [
+      'hs_object_id', 'hs_call_title', 'hs_call_body',
+      'hs_timestamp', 'hubspot_owner_id', 'callbox_postmeet_generated'
+    ],
+    sorts: [{ propertyName: 'hs_createdate', direction: 'DESCENDING' }],
+    limit: 20
+  });
+
+  const calls = result.body?.results || [];
+  const unprocessed = calls.filter(c =>
+    c.properties?.callbox_postmeet_generated !== 'true' &&
+    !processed.includes(`flowB_${c.id}`)
+  );
+
+  console.log(`  Found ${calls.length} calls, ${unprocessed.length} unprocessed`);
+
+  for (const call of unprocessed) {
+    const p = call.properties;
+    const callNotes = p.hs_call_body || '';
+    if (!callNotes.trim()) continue;
+
+    console.log(`  Processing call: ${p.hs_call_title}`);
+
+    try {
+      // Get associated contact
+      const assoc = await hsGet(
+        `/crm/v4/objects/calls/${call.id}/associations/contacts`,
+        token
+      );
+      const contactId = assoc.body?.results?.[0]?.toObjectId;
+      let contactInfo = { name: 'Unknown', company: 'Unknown', jobtitle: 'Unknown', website: '' };
+
+      if (contactId) {
+        const contactRes = await hsGet(
+          `/crm/v3/objects/contacts/${contactId}?properties=firstname,lastname,company,jobtitle,website`,
+          token
+        );
+        const cp = contactRes.body?.properties || {};
+        contactInfo = {
+          name: `${cp.firstname || ''} ${cp.lastname || ''}`.trim() || 'Unknown',
+          company: cp.company || 'Unknown',
+          jobtitle: cp.jobtitle || 'Unknown',
+          website: cp.website || ''
+        };
+      }
+
+      // Generate debrief
+      const debrief = await generateIntel(postMeetingPrompt(contactInfo, callNotes.slice(0, 2000)));
+
+      // Store in fleet DB
+      await storeMemory(`SALES MEETING INTEL — Post-Meeting\nContact: ${contactInfo.name} @ ${contactInfo.company}\nDate: ${new Date().toISOString().split('T')[0]}\n\n${debrief}`);
+
+      // Get owner Telegram ID
+      const ownerEmail = p.hubspot_owner_id ? await getOwnerEmail(p.hubspot_owner_id, token) : null;
+      const tgId = ownerEmail ? await getOwnerTelegramId(ownerEmail) : FALLBACK_TG_ID;
+
+      // Send DM
+      const msg = `📝 Post-meeting debrief ready for ${contactInfo.name} at ${contactInfo.company}\n\n${debrief.slice(0, 800)}...`;
+      await sendTelegramDM(tgId, msg);
+      console.log(`  Sent to TG: ${tgId}`);
+
+      // Mark processed
+      processed.push(`flowB_${call.id}`);
+
+      await hsPatch(`/crm/v3/objects/calls/${call.id}`, token, {
+        properties: { callbox_postmeet_generated: 'true' }
+      });
+
+    } catch (err) {
+      console.error(`  Error processing call ${call.id}: ${err.message}`);
+    }
+  }
+
+  return unprocessed.length;
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+async function main() {
+  console.log(`=== sales-meeting-intel poll — ${new Date().toISOString()} ===`);
+
+  const processed = loadProcessed();
+  let flowACount = 0, flowBCount = 0;
+
+  try {
+    const token = await getHubSpotToken();
+    console.log('HubSpot auth: OK');
+
+    flowACount = await runFlowA(token, processed);
+    flowBCount = await runFlowB(token, processed);
+
+    saveProcessed(processed);
+  } catch (err) {
+    console.error(`FATAL: ${err.message}`);
+    process.exit(1);
+  }
+
+  console.log(`\n=== Done: Flow A processed ${flowACount}, Flow B processed ${flowBCount} ===`);
+}
+
+main().catch(err => { console.error(err); process.exit(1); });

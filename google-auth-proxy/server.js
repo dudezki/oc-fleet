@@ -141,6 +141,44 @@ async function deleteRefreshToken(email) {
   try { fs.unlinkSync(path.join(TOKEN_DIR, `${email}.token`)); } catch {}
 }
 
+// ─── OAuth persistence tables ──────────────────────────────────────────────────
+
+async function initOAuthTables() {
+  try {
+    await dbQuery(`
+      CREATE TABLE IF NOT EXISTS fleet.google_oauth_pending (
+        state TEXT PRIMARY KEY,
+        scopes TEXT[],
+        created_at TIMESTAMPTZ DEFAULT now(),
+        expires_at TIMESTAMPTZ NOT NULL
+      )
+    `);
+    await dbQuery(`
+      CREATE TABLE IF NOT EXISTS fleet.google_oauth_completed (
+        state TEXT PRIMARY KEY,
+        email TEXT,
+        completed_at TIMESTAMPTZ DEFAULT now()
+      )
+    `);
+    // Cleanup expired entries on startup
+    await dbQuery(`DELETE FROM fleet.google_oauth_pending WHERE expires_at < now()`);
+    await dbQuery(`DELETE FROM fleet.google_oauth_completed WHERE completed_at < now() - INTERVAL '60 seconds'`);
+    console.log('[google-auth] OAuth persistence tables ready');
+  } catch (e) {
+    console.warn('[google-auth] Could not init OAuth tables:', e.message);
+  }
+}
+
+// Periodic cleanup every 10 minutes
+setInterval(async () => {
+  try {
+    await dbQuery(`DELETE FROM fleet.google_oauth_pending WHERE expires_at < now()`);
+    await dbQuery(`DELETE FROM fleet.google_oauth_completed WHERE completed_at < now() - INTERVAL '60 seconds'`);
+  } catch (e) {
+    console.warn('[google-auth] Periodic OAuth cleanup error:', e.message);
+  }
+}, 10 * 60 * 1000);
+
 // ─── In-memory session store ──────────────────────────────────────────────────
 
 const sessions = new Map(); // email → session
@@ -313,6 +351,11 @@ const server = http.createServer(async (req, res) => {
         const timer = setTimeout(() => { pendingAuths.delete(state); reject(new Error('timeout')); }, TIMEOUT);
         pendingAuths.set(state, { resolve, reject, scopes, timer });
       }).catch(() => {});
+      // Persist to DB so state survives process restarts
+      dbQuery(
+        `INSERT INTO fleet.google_oauth_pending (state, scopes, expires_at) VALUES ($1, $2, now() + INTERVAL '1 hour') ON CONFLICT (state) DO NOTHING`,
+        [state, scopes]
+      ).catch(e => console.warn('[google-auth] DB insert pending failed:', e.message));
       return json(200, { auth_url: authUrl, state });
     } catch (err) {
       return json(400, { error: err.message });
@@ -323,6 +366,18 @@ const server = http.createServer(async (req, res) => {
   if (parsed.pathname === '/auth/status') {
     const { state, email } = parsed.query;
     if (state && pendingAuths.has(state)) return json(200, { status: 'pending' });
+    if (state) {
+      try {
+        // Check DB completed table (callback fired after restart)
+        const cr = await dbQuery(`SELECT email FROM fleet.google_oauth_completed WHERE state=$1`, [state]);
+        if (cr.rows.length) return json(200, { status: 'done', email: cr.rows[0].email });
+        // Check DB pending table (still waiting, process restarted)
+        const pr = await dbQuery(`SELECT state FROM fleet.google_oauth_pending WHERE state=$1 AND expires_at > now()`, [state]);
+        if (pr.rows.length) return json(200, { status: 'pending' });
+      } catch (e) {
+        console.warn('[google-auth] DB status check error:', e.message);
+      }
+    }
     if (email && getSession(email)) return json(200, { status: 'authenticated', email });
     return json(200, { status: 'unauthenticated' });
   }
@@ -380,17 +435,43 @@ const server = http.createServer(async (req, res) => {
       return html(400, `<html><body style="font-family:sans-serif;background:#0f1117;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center"><h2>❌ Access cancelled</h2><p style="color:#64748b">Close this tab and try again.</p></div></body></html>`);
     }
 
-    if (!code || !state || !pendingAuths.has(state)) {
+    // Determine if state is valid: check in-memory first, then DB (for post-restart)
+    let pendingFromDb = null;
+    if (!code || !state) {
+      return html(400, '<h2>Invalid or expired auth request.</h2>');
+    }
+    if (!pendingAuths.has(state)) {
+      // Check in-memory dedup
       if (completedCallbacks.has(state)) {
         return html(200, `<html><body style="font-family:sans-serif;background:#0f1117;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center"><h2>✅ Already connected</h2><p style="color:#64748b">You can close this tab.</p></div></body></html>`);
       }
-      return html(400, '<h2>Invalid or expired auth request.</h2>');
+      // Check DB completed (already processed after restart)
+      try {
+        const cr = await dbQuery(`SELECT email FROM fleet.google_oauth_completed WHERE state=$1`, [state]);
+        if (cr.rows.length) {
+          return html(200, `<html><body style="font-family:sans-serif;background:#0f1117;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center"><h2>✅ Already connected</h2><p style="color:#64748b">You can close this tab.</p></div></body></html>`);
+        }
+      } catch (e) { console.warn('[google-auth] DB completed check error:', e.message); }
+      // Check DB pending (state was created before a restart)
+      try {
+        const pr = await dbQuery(`SELECT scopes FROM fleet.google_oauth_pending WHERE state=$1 AND expires_at > now()`, [state]);
+        if (pr.rows.length) {
+          pendingFromDb = { scopes: pr.rows[0].scopes || [] };
+        }
+      } catch (e) { console.warn('[google-auth] DB pending check error:', e.message); }
+      if (!pendingFromDb) {
+        return html(400, '<h2>Invalid or expired auth request.</h2>');
+      }
     }
 
     try {
-      const pending = pendingAuths.get(state);
-      pendingAuths.delete(state);
-      clearTimeout(pending.timer);
+      const pending = pendingAuths.has(state) ? pendingAuths.get(state) : pendingFromDb;
+      if (pendingAuths.has(state)) {
+        pendingAuths.delete(state);
+        clearTimeout(pending.timer);
+      }
+      // Remove from DB pending table (cleanup)
+      dbQuery(`DELETE FROM fleet.google_oauth_pending WHERE state=$1`, [state]).catch(() => {});
 
       const tokenData = await exchangeCode(code);
       if (!tokenData?.access_token) throw new Error('Token exchange failed');
@@ -400,7 +481,7 @@ const server = http.createServer(async (req, res) => {
       if (!email) throw new Error('Could not get email from Google');
 
       if (!email.endsWith('@' + ALLOWED_DOMAIN)) {
-        pending.reject(new Error('Unauthorized domain: ' + email));
+        if (pending.reject) pending.reject(new Error('Unauthorized domain: ' + email));
         return html(403, `<html><body style="font-family:sans-serif;background:#0f1117;color:#e2e8f0;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0"><div style="text-align:center"><h2>🔒 Access Denied</h2><p style="color:#f87171">${email}</p><p style="color:#64748b">Only @callboxinc.com accounts allowed.</p></div></body></html>`);
       }
 
@@ -413,9 +494,19 @@ const server = http.createServer(async (req, res) => {
       if (tokenData.refresh_token) saveRefreshToken(email, tokenData.refresh_token, pending.scopes || []).catch(console.error);
       touchSession(email);
 
-      completedCallbacks.set(state, { email, ts: Date.now() });
-      setTimeout(() => completedCallbacks.delete(state), 60000);
-      pending.resolve({ email, session });
+      if (pendingFromDb) {
+        // State was from DB (post-restart) — store completion in DB for status polling
+        dbQuery(
+          `INSERT INTO fleet.google_oauth_completed (state, email) VALUES ($1, $2) ON CONFLICT (state) DO NOTHING`,
+          [state, email]
+        ).catch(() => {});
+        setTimeout(() => dbQuery(`DELETE FROM fleet.google_oauth_completed WHERE state=$1`, [state]).catch(() => {}), 60000);
+      } else {
+        // Normal in-memory flow
+        completedCallbacks.set(state, { email, ts: Date.now() });
+        setTimeout(() => completedCallbacks.delete(state), 60000);
+        pending.resolve({ email, session });
+      }
 
       return html(200, `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"/><title>Connected — Callbox AI</title>
 <style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center;}
@@ -698,8 +789,8 @@ p{font-size:13px;color:#64748b;line-height:1.6;}
   res.end('Not found');
 });
 
-// Load redirect URI from DB before starting
-loadRedirectUriFromDb().then(() => server.listen(PORT, '127.0.0.1', () => {
+// Load redirect URI from DB and init OAuth tables before starting
+initOAuthTables().then(() => loadRedirectUriFromDb()).then(() => server.listen(PORT, '127.0.0.1', () => {
   console.log(`[google-auth] Running on http://127.0.0.1:${PORT}`);
   console.log(`[google-auth] Callback: ${REDIRECT_URI}`);
   console.log(`[google-auth] Token store: ${TOKEN_DIR}`);

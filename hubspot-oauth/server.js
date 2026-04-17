@@ -768,11 +768,55 @@ setInterval(async () => {
   }
 }, 4 * 60 * 60 * 1000);
 
+async function bootstrapSessionsFromDB() {
+  try {
+    const result = await dbPool.query(`
+      SELECT ui.credentials, a.email, ui.portal_id, ui.account_id
+      FROM fleet.user_integrations ui
+      JOIN fleet.accounts a ON a.id = ui.account_id
+      WHERE ui.integration = 'hubspot'
+        AND ui.enabled = true
+        AND (ui.expires_at IS NULL OR ui.expires_at > now())
+    `);
+    console.log(`[hubspot-oauth] [bootstrap] Found ${result.rows.length} active HubSpot integration(s)`);
+    for (const row of result.rows) {
+      const { email, portal_id } = row;
+      try {
+        const creds = typeof row.credentials === 'string' ? JSON.parse(row.credentials) : row.credentials;
+        const { refresh_token } = creds;
+        if (!refresh_token) {
+          console.warn(`[hubspot-oauth] [bootstrap] No refresh_token for ${email} portal ${portal_id} — skipping`);
+          continue;
+        }
+        // Pre-seed session so refreshAccessToken has somewhere to store the token
+        const key = sessionKey(email, portal_id);
+        if (!sessions.get(key)) {
+          sessions.set(key, {
+            email,
+            hub_id: String(portal_id),
+            refresh_token,
+            refresh_token_issued_at: Date.now(),
+            access_token: null,
+            expires_at: 0,
+          });
+        }
+        await refreshAccessToken(email, portal_id, refresh_token);
+        console.log(`[hubspot-oauth] [bootstrap] Loaded session for ${email} portal ${portal_id}`);
+      } catch (err) {
+        console.error(`[hubspot-oauth] [bootstrap] Failed for ${email} portal ${portal_id}: ${err.message}`);
+      }
+    }
+  } catch (err) {
+    console.error(`[hubspot-oauth] [bootstrap] DB query failed: ${err.message}`);
+  }
+}
+
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[hubspot-oauth] Server listening on http://127.0.0.1:${PORT}`);
   console.log(`[hubspot-oauth] Callback URL: ${REDIRECT_URI}`);
   console.log(`[hubspot-oauth] Token store: ${TOKEN_DIR}`);
   console.log(`[hubspot-oauth] Supported portals: ${Object.entries(KNOWN_PORTALS).map(([id,n]) => `${n} (${id})`).join(', ')}`);
+  bootstrapSessionsFromDB();
 });
 
 process.on('SIGTERM', () => { console.log('[hubspot-oauth] Shutting down...'); server.close(); });

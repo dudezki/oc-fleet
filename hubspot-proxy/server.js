@@ -399,7 +399,7 @@ app.post('/query', async (req, res) => {
         return res.status(403).json({ error: `Object type '${object}' not allowed for your role (${identity.positionGroup})`, code: 'OBJECT_ACCESS_DENIED' });
       }
     }
-    if (isCustomObject && allowedObjects.length > 0 && !allowedObjects.includes('custom')) {
+    if (isCustomObject && allowedObjects.length > 0 && !allowedObjects.includes('custom') && !allowedObjects.includes(object)) {
       return res.status(403).json({ error: `Custom object access not allowed for your role (${identity.positionGroup})`, code: 'OBJECT_ACCESS_DENIED' });
     }
 
@@ -1006,6 +1006,16 @@ app.post('/qualify', async (req, res) => {
     const dp = deals[0]?.properties || {};
     const now = Date.now();
 
+    // --- Detect lead type (inbound vs outbound) ---
+    const leadSource = (cp.hs_analytics_source || cp.lead_source || dp.hs_analytics_source || '').toLowerCase();
+    const isInbound = /organic|referral|social|email|direct|paid|content|inbound/.test(leadSource) || !leadSource;
+    const leadType = isInbound ? 'inbound' : 'outbound';
+
+    // FAINT weights: inbound vs outbound
+    const weights = isInbound
+      ? { fit: 30, interest: 20, authority: 15, need: 15, timeline: 5, competitor: 10 }
+      : { fit: 40, interest: 10, authority: 25, need: 20, timeline: 2, competitor: 3 };
+
     // --- FAINT Scoring ---
     let scores = { fit: 0, interest: 0, authority: 0, need: 0, timeline: 0, competitor: 0 };
     let reasoning = {};
@@ -1046,10 +1056,11 @@ app.post('/qualify', async (req, res) => {
     let authScore = 0;
     const authNotes = [];
     const titleLow = (cp.jobtitle || '').toLowerCase();
-    if (/\b(ceo|coo|cfo|cto|ciso|chief|president|owner|founder|partner)\b/.test(titleLow)) { authScore = 15; authNotes.push('C-level / Owner'); }
-    else if (/\b(vp|vice president|svp|evp|director|head of)\b/.test(titleLow)) { authScore = 12; authNotes.push('VP / Director'); }
-    else if (/\b(manager|lead|senior|principal)\b/.test(titleLow)) { authScore = 8; authNotes.push('Manager / Lead'); }
-    else if (cp.jobtitle) { authScore = 4; authNotes.push('Individual contributor'); }
+    if (/\b(ceo|coo|cfo|cto|ciso|cmo|chief|president|owner|founder|partner)\b/.test(titleLow)) { authScore = weights.authority; authNotes.push('C-level / Owner'); }
+    else if (/\b(vp|vice president|svp|evp|country manager|regional director|marketing manager)\b/.test(titleLow)) { authScore = weights.authority; authNotes.push('VP / Country Manager / Regional Director / Marketing Manager'); }
+    else if (/\b(director|head of)\b/.test(titleLow)) { authScore = Math.round(weights.authority * 0.8); authNotes.push('Director / Head of'); }
+    else if (/\b(manager|lead|senior|principal)\b/.test(titleLow)) { authScore = Math.round(weights.authority * 0.55); authNotes.push('Manager / Lead'); }
+    else if (cp.jobtitle) { authScore = Math.round(weights.authority * 0.27); authNotes.push('Individual contributor'); }
     scores.authority = authScore;
     reasoning.authority = authNotes;
 
@@ -1078,7 +1089,7 @@ app.post('/qualify', async (req, res) => {
     if (daysSinceContact !== null && daysSinceContact <= 7) { timelineScore += 4; timelineNotes.push(`Contacted ${daysSinceContact}d ago`); }
     else if (daysSinceContact !== null && daysSinceContact <= 30) { timelineScore += 2; timelineNotes.push(`Contacted ${daysSinceContact}d ago`); }
     else if (daysSinceContact !== null && daysSinceContact > 60) { timelineScore -= 3; timelineNotes.push(`Stalled ${daysSinceContact}d since last contact`); }
-    scores.timeline = Math.max(0, Math.min(timelineScore, 10));
+    scores.timeline = Math.max(0, Math.min(timelineScore, weights.timeline));
     reasoning.timeline = timelineNotes;
 
     // COMPETITOR (10pts max) — no direct signal, base on deal priority/amount
@@ -1091,6 +1102,15 @@ app.post('/qualify', async (req, res) => {
     scores.competitor = compScore;
     reasoning.competitor = compNotes;
 
+    // Apply weights to raw scores (normalize each dimension to its weight)
+    const weightedTotal = Math.round(
+      (scores.fit / weights.fit * weights.fit) +
+      (scores.interest / weights.interest * weights.interest) +
+      (scores.authority / weights.authority * weights.authority) +
+      (scores.need / weights.need * weights.need) +
+      (scores.timeline / Math.max(weights.timeline, 1) * weights.timeline) +
+      (scores.competitor / weights.competitor * weights.competitor)
+    );
     const total = Object.values(scores).reduce((a, b) => a + b, 0);
     const maxScore = 100;
     const normalizedTotal = Math.round((total / maxScore) * 100);
@@ -1121,12 +1141,13 @@ app.post('/qualify', async (req, res) => {
         close_date: dp.closedate,
       } : null,
       breakdown: {
-        fit:        { score: scores.fit,        max: 30, weight: '30%', notes: reasoning.fit },
-        interest:   { score: scores.interest,   max: 20, weight: '20%', notes: reasoning.interest },
-        authority:  { score: scores.authority,  max: 15, weight: '15%', notes: reasoning.authority },
-        need:       { score: scores.need,       max: 15, weight: '15%', notes: reasoning.need },
-        timeline:   { score: scores.timeline,   max: 10, weight: '10%', notes: reasoning.timeline },
-        competitor: { score: scores.competitor, max: 10, weight: '10%', notes: reasoning.competitor },
+        lead_type:  leadType,
+        fit:        { score: scores.fit,        max: weights.fit,        weight: weights.fit+'%',        notes: reasoning.fit },
+        interest:   { score: scores.interest,   max: weights.interest,   weight: weights.interest+'%',   notes: reasoning.interest },
+        authority:  { score: scores.authority,  max: weights.authority,  weight: weights.authority+'%',  notes: reasoning.authority },
+        need:       { score: scores.need,       max: weights.need,       weight: weights.need+'%',       notes: reasoning.need },
+        timeline:   { score: scores.timeline,   max: weights.timeline,   weight: weights.timeline+'%',   notes: reasoning.timeline },
+        competitor: { score: scores.competitor, max: weights.competitor, weight: weights.competitor+'%', notes: reasoning.competitor },
       },
       portal: 'MarketingCRM',
       caller: { email: identity.email, positionGroup: identity.positionGroup },

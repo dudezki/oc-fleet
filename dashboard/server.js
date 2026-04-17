@@ -10,7 +10,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 const { chunkText, embedTexts } = require('../proxy/chunker');
 
-const GEMINI_API_KEY = 'AIzaSyAksgdKNgnQ74ShoABJ2r6iik3yOXkqZUk';
+const GEMINI_API_KEY = 'AIzaSyBAbuhtpfMVbq3bPRHBKkm0YwpYAxKxv_c';
 
 const pgPool = new Pool({ connectionString: 'postgresql://postgres:fleetdev@127.0.0.1:5433/fleet_dev' });
 
@@ -699,18 +699,48 @@ app.get('/api/otp-status', async (req, res) => {
   }
 });
 
-// GET /api/memories
+// GET /api/memories?page=1&limit=50&agent_id=&type=&search=
 app.get('/api/memories', async (req, res) => {
   try {
-    const response = await fetch(`http://127.0.0.1:${PROXY_PORT}/fleet-api/retrieve`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ org_id: ORG_ID }), signal: AbortSignal.timeout(5000),
+    const page = Math.max(1, parseInt(req.query.page || '1'));
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit || '50')));
+    const offset = (page - 1) * limit;
+    const agentId = req.query.agent_id || null;
+    const memType = req.query.type || null;
+    const search = req.query.search || null;
+
+    const conditions = ['m.org_id = $1'];
+    const params = [ORG_ID];
+    let i = 2;
+    if (agentId) { conditions.push(`m.agent_id = $${i++}`); params.push(agentId); }
+    if (memType) { conditions.push(`m.memory_type = $${i++}`); params.push(memType); }
+    if (search) { conditions.push(`m.content ILIKE $${i++}`); params.push(`%${search}%`); }
+
+    const where = conditions.join(' AND ');
+
+    const [rows, countRes] = await Promise.all([
+      pgPool.query(`
+        SELECT m.id, m.content, m.memory_type, m.salience, m.visibility,
+               m.created_at, m.updated_at, m.user_id,
+               a.name as agent_name, a.slug as agent_slug,
+               acc.name as user_name
+        FROM fleet.memories m
+        LEFT JOIN fleet.agents a ON a.id = m.agent_id
+        LEFT JOIN fleet.accounts acc ON acc.id = m.user_id
+        WHERE ${where}
+        ORDER BY m.created_at DESC
+        LIMIT $${i} OFFSET $${i+1}`, [...params, limit, offset]),
+      pgPool.query(`SELECT COUNT(*) FROM fleet.memories m WHERE ${where}`, params)
+    ]);
+
+    res.json({
+      memories: rows.rows,
+      total: parseInt(countRes.rows[0].count),
+      page, limit,
+      pages: Math.ceil(countRes.rows[0].count / limit)
     });
-    const data = await response.json();
-    res.json(data);
   } catch (err) {
-    res.status(502).json({ error: 'Proxy unreachable', detail: err.message });
+    res.status(500).json({ error: 'Database error', detail: err.message });
   }
 });
 
@@ -1124,7 +1154,7 @@ app.get('/api/memory-stats', async (req, res) => {
       GROUP BY memory_type ORDER BY count DESC
     `, [ORG_ID]);
     const byAgent = await pgPool.query(`
-      SELECT COALESCE(a.name, 'Unknown') as agent_name, COUNT(m.id) as count,
+      SELECT COALESCE(a.name, 'Org / Shared') as agent_name, COUNT(m.id) as count,
              ROUND(AVG(m.salience)::numeric, 2) as avg_salience
       FROM fleet.memories m
       LEFT JOIN fleet.agents a ON a.id = m.agent_id
@@ -2537,6 +2567,132 @@ app.get('/api/reports/cost', async (req, res) => {
       by_agent: byAgentQ.rows,
       by_day: byDayQ.rows,
       top_conversations: topConvsQ.rows,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/reports/fleet-cost — messages cost/token breakdown (CSV-style table)
+// Query params: fleet (agent_id), user_id, from=YYYY-MM-DD, to=YYYY-MM-DD (Asia/Manila)
+app.get('/api/reports/fleet-cost', async (req, res) => {
+  const { fleet = null, user_id = null, from = null, to = null } = req.query;
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const pageSize = Math.min(200, Math.max(1, parseInt(req.query.page_size || '10', 10)));
+  const offset = (page - 1) * pageSize;
+  const SORT_COLUMNS = {
+    agent_name: 'ag.name',
+    user_name: 'a.name',
+    cost_usd: 'm.cost_usd',
+    input_tokens: 'm.input_tokens',
+    output_tokens: 'm.output_tokens',
+    cache_read_tokens: 'm.cache_read_tokens',
+    cache_write_tokens: 'm.cache_write_tokens',
+    cache_total_tokens: '(COALESCE(m.cache_read_tokens,0) + COALESCE(m.cache_write_tokens,0))',
+    total_tokens: 'm.total_tokens',
+    created_at: 'm.created_at',
+    created_at_ph: 'm.created_at',
+  };
+  const sortBy = SORT_COLUMNS[req.query.sort_by] || 'm.created_at';
+  const sortDir = (req.query.sort_dir || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  try {
+    const conds = [];
+    const params = [];
+    if (fleet)   { params.push(fleet);   conds.push(`m.agent_id = $${params.length}::uuid`); }
+    if (user_id) { params.push(user_id); conds.push(`m.user_id  = $${params.length}::uuid`); }
+    if (from)    { params.push(from);    conds.push(`m.created_at >= $${params.length}::timestamptz`); }
+    if (to)      { params.push(to);      conds.push(`m.created_at <= $${params.length}::timestamptz`); }
+    const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+    const dataParams = [...params, pageSize + 1, offset];
+    const r = await pgPool.query(
+      `SELECT
+         m.id,
+         m.content,
+         m.token_count,
+         m.input_tokens,
+         m.output_tokens,
+         m.cache_read_tokens,
+         m.cache_write_tokens,
+         (COALESCE(m.cache_read_tokens,0) + COALESCE(m.cache_write_tokens,0))::bigint AS cache_total_tokens,
+         m.total_tokens,
+         m.cost_usd,
+         to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')          AS created_at_utc,
+         to_char(m.created_at AT TIME ZONE 'Asia/Manila', 'YYYY-MM-DD HH24:MI:SS')   AS created_at_ph,
+         CASE WHEN cv.chat_type = 'direct' THEN 'DM'
+              WHEN cv.chat_type = 'group'  THEN 'GC'
+              ELSE '—' END AS chat_type,
+         a.name  AS user_name,
+         ag.name AS agent_name,
+         ag.config->'meta'->>'model' AS model
+       FROM fleet.messages m
+       LEFT JOIN fleet.accounts a ON m.user_id  = a.id
+       LEFT JOIN fleet.agents  ag ON m.agent_id = ag.id
+       LEFT JOIN fleet.conversations cv ON m.conversation_id = cv.id
+       ${where}
+       ORDER BY ${sortBy} ${sortDir} NULLS LAST, m.id ${sortDir}
+       LIMIT $${dataParams.length - 1} OFFSET $${dataParams.length}`,
+      dataParams
+    );
+    const hasMore = r.rows.length > pageSize;
+    const rows = hasMore ? r.rows.slice(0, pageSize) : r.rows;
+    res.json({
+      filters: { fleet, user_id, from, to },
+      rows,
+      pagination: { page, page_size: pageSize, has_more: hasMore, has_prev: page > 1 },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/reports/fleet-cost/summary — per-user aggregates (same filters as fleet-cost)
+app.get('/api/reports/fleet-cost/summary', async (req, res) => {
+  const { fleet = null, user_id = null, from = null, to = null } = req.query;
+  try {
+    const conds = [];
+    const params = [];
+    if (fleet)   { params.push(fleet);   conds.push(`m.agent_id = $${params.length}::uuid`); }
+    if (user_id) { params.push(user_id); conds.push(`m.user_id  = $${params.length}::uuid`); }
+    if (from)    { params.push(from);    conds.push(`m.created_at >= $${params.length}::timestamptz`); }
+    if (to)      { params.push(to);      conds.push(`m.created_at <= $${params.length}::timestamptz`); }
+    const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+    const byUser = await pgPool.query(
+      `SELECT
+         m.user_id,
+         COALESCE(a.name, '(unknown)') AS user_name,
+         COUNT(*)::int                        AS message_count,
+         COALESCE(SUM(m.input_tokens), 0)::bigint       AS input_tokens,
+         COALESCE(SUM(m.output_tokens), 0)::bigint      AS output_tokens,
+         COALESCE(SUM(m.cache_read_tokens), 0)::bigint  AS cache_read_tokens,
+         COALESCE(SUM(m.cache_write_tokens), 0)::bigint AS cache_write_tokens,
+         COALESCE(SUM(m.total_tokens), 0)::bigint       AS total_tokens,
+         COALESCE(SUM(m.cost_usd), 0)                   AS total_cost_usd
+       FROM fleet.messages m
+       LEFT JOIN fleet.accounts a ON m.user_id = a.id
+       ${where}
+       GROUP BY m.user_id, a.name
+       ORDER BY total_cost_usd DESC`,
+      params
+    );
+
+    const totals = await pgPool.query(
+      `SELECT
+         COUNT(*)::int                        AS message_count,
+         COUNT(DISTINCT m.user_id)::int       AS user_count,
+         COUNT(DISTINCT m.agent_id)::int      AS agent_count,
+         COALESCE(SUM(m.total_tokens), 0)::bigint AS total_tokens,
+         COALESCE(SUM(m.cost_usd), 0)             AS total_cost_usd
+       FROM fleet.messages m
+       ${where}`,
+      params
+    );
+
+    res.json({
+      filters: { fleet, user_id, from, to },
+      totals: totals.rows[0],
+      by_user: byUser.rows,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });

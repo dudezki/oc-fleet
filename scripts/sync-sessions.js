@@ -20,6 +20,11 @@ const AGENT_FALLBACK = [
   { slug: 'dev',     id: '87a2838e-e145-4f5c-99e2-c759f0591cba' },
   { slug: 'it',      id: '20dc090b-90a3-403f-acc3-a1ac7008596d' },
   { slug: 'hr',      id: '8a2ce3b0-ed67-460b-a79e-e3baeeacc51e' },
+  { slug: 'cs',         id: '5acb77f3-672b-4c70-b849-90d59cc9cf37' },
+  { slug: 'documentor', id: 'dc0aff14-f24a-47a0-808e-f2d437e1636d' },
+  { slug: 'marketing',  id: '792ceca1-77d9-425a-85c0-c7903eeb5b13' },
+  { slug: 'finance',    id: 'd6a557d1-6e81-4144-991d-d26c68a1f64f' },
+  { slug: 'ld',         id: 'b88cfe75-aa66-4a9a-8c71-25b4d3f0aca8' },
 ];
 
 const STATE_FILE = path.join(os.homedir(), '.cbfleet-sync-state.json');

@@ -6,13 +6,14 @@ export PATH="/usr/bin:$PATH"
 #   ./fleet.sh stop    [sales|support|manager|dev|it|all]
 #   ./fleet.sh restart [sales|support|manager|dev|it|all]
 #   ./fleet.sh status
+#   ./fleet.sh logs    [sales|support|manager|dev|it|proxy|dashboard|aegis|...]
 
 cmd="${1:-status}"
 target="${2:-all}"
 
-port_for()   { case $1 in sales) echo 20010;; support) echo 20020;; manager) echo 20030;; dev) echo 20040;; it) echo 20050;; hr) echo 20060;; finance) echo 20070;; security) echo 20080;; documentor) echo 20090;; marketing) echo 20085;; esac; }
+port_for()   { case $1 in sales) echo 20010;; support) echo 20020;; manager) echo 20030;; dev) echo 20040;; it) echo 20050;; hr) echo 20060;; finance) echo 20070;; ld) echo 20080;; documentor) echo 20090;; marketing) echo 20085;; cs) echo 20065;; sirrom) echo 20100;; esac; }
 home_for()   { echo "$HOME/cbfleet-rag-$1"; }
-instances()  { [ "$target" = "all" ] && echo "sales support manager dev it hr finance security documentor marketing" || echo "$target"; }
+instances()  { [ "$target" = "all" ] && echo "sales support manager dev it hr finance ld documentor marketing cs" sirrom || echo "$target"; }
 
 PROXY_PORT=20000
 PROXY_JS=/home/dev-user/Projects/oc-fleet/proxy/server.js
@@ -191,7 +192,7 @@ stop_instance() {
 
 status_all() {
   echo "=== Fleet Status ==="
-  for inst in sales support manager dev it hr finance security documentor marketing; do
+  for inst in sales support manager dev it hr finance security documentor marketing cs; do
     local port r
     port=$(port_for "$inst")
     r=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:$port/health 2>/dev/null)
@@ -238,6 +239,18 @@ case "$cmd" in
   hubspot-oauth)  stop_hubspot_oauth; start_hubspot_oauth ;;
   hubspot-proxy)  stop_hubspot_proxy; start_hubspot_proxy ;;
   status)      status_all ;;
+  logs)
+    if [ -z "$target" ] || [ "$target" = "all" ]; then
+      echo "Usage: fleet.sh logs <agent>  (e.g. dev, proxy, dashboard, aegis)"
+      exit 1
+    fi
+    log_file="/tmp/fleet-${target}.log"
+    if [ ! -f "$log_file" ]; then
+      echo "❌ Log file not found: $log_file"
+      exit 1
+    fi
+    echo "=== Last 50 lines: $log_file ==="
+    tail -n 50 "$log_file" ;;
   *)
-    echo "Usage: fleet.sh [start|stop|restart|proxy|dashboard|status] [sales|support|manager|all]" ;;
+    echo "Usage: fleet.sh [start|stop|restart|proxy|dashboard|status|logs] [sales|support|manager|dev|it|all]" ;;
 esac

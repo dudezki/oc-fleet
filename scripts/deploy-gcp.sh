@@ -218,7 +218,7 @@ create_instance() {
       }
     }
   },
-  "session": { "dmScope": "main" }
+  "session": { "dmScope": "per-peer" }
 }
 EOF
 

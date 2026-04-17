@@ -67,7 +67,7 @@ async function proxyPost(endpoint, body) {
 async function sendTelegramMessage(botToken, chatId, text) {
   const https = require('https');
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ chat_id: chatId, text, parse_mode: 'Markdown' });
+    const body = JSON.stringify({ chat_id: chatId, text });
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${botToken}/sendMessage`,
@@ -273,7 +273,28 @@ async function run() {
           }
         }
 
-        const result = await injectToAgent(agentInfo, eventText, telegramId, handoff.target_type);
+        // For org broadcasts, send to ALL users bound to this agent
+        let result;
+        if (handoff.target_type === 'org' && agentInfo.bot_token) {
+          const boundUsers = await pg.query(
+            `SELECT DISTINCT telegram_id FROM fleet.telegram_bindings
+             WHERE agent_id = $1 AND org_id = $2`,
+            [agentId, handoff.org_id]
+          );
+          // Recipients = bound users + fallback to initiating telegram_id if none
+          const recipients = new Set(boundUsers.rows.map(u => u.telegram_id));
+          if (recipients.size === 0 && telegramId) recipients.add(telegramId);
+          let sent = 0, failed = 0;
+          for (const chatId of recipients) {
+            const tgResult = await sendTelegramMessage(agentInfo.bot_token, chatId, eventText);
+            if (tgResult.ok) { sent++; }
+            else { failed++; console.warn(`[worker] ⚠️ Broadcast to ${chatId} via ${agentInfo.name}: ${tgResult.description||JSON.stringify(tgResult)}`); }
+          }
+          console.log(`[worker] ✅ Org broadcast via ${agentInfo.name}: ${sent} sent, ${failed} failed`);
+          result = { success: sent > 0, error: recipients.size === 0 ? 'no_recipients' : (failed > 0 ? `${failed} failed` : null) };
+        } else {
+          result = await injectToAgent(agentInfo, eventText, telegramId, handoff.target_type);
+        }
         notifiedAgents.push({
           agent_id: agentId,
           agent_name: agentInfo.name,

@@ -112,12 +112,30 @@ async function syncAgent(agent) {
     const toSync = [];
     let latestTs = lastTs;
 
+    // Pre-scan to find session owner's telegram_id (fixes attribution for early assistant messages)
+    let sessionTelegramId = null;
+    let sessionTelegramName = null;
+    for (const line of lines) {
+      try {
+        const d = JSON.parse(line);
+        if (d.type !== 'message' || d.message?.role !== 'user') continue;
+        let rawText = Array.isArray(d.message.content)
+          ? d.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+          : String(d.message.content || '');
+        // Skip system/reset messages
+        if (rawText.includes('A new session was started') || rawText.includes('Current time:')) continue;
+        sessionTelegramId = extractTelegramId(rawText);
+        sessionTelegramName = extractSenderName(rawText);
+        if (sessionTelegramId) break;
+      } catch {}
+    }
+
     // Track last seen GC context so assistant messages inherit the correct conversation bucket
     let lastChatId = null;
     let lastIsGroup = false;
     let lastGroupSubject = null;
-    let lastTelegramId = null;
-    let lastTelegramName = null;
+    let lastTelegramId = sessionTelegramId; // Start with pre-scanned session owner
+    let lastTelegramName = sessionTelegramName;
 
     for (const line of lines) {
       try {
@@ -189,7 +207,7 @@ async function syncAgent(agent) {
 
     // Group consecutive messages by telegram_id / chat_id for efficient logging
     for (const msg of toSync) {
-      const tid = msg.telegram_id || '6759764460'; // fallback to org owner
+      const tid = msg.telegram_id || sessionTelegramId || '6759764460'; // fallback to session owner, then org owner
       // For group chats, use the group chat ID as the conversation bucket
       const convId = (msg.is_group && msg.chat_id) ? msg.chat_id : tid;
       const chatType = msg.is_group ? 'group' : 'direct';
